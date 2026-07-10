@@ -1,0 +1,16 @@
+game:
+  board_size: 9
+  komi: 6.5
+  rules:
+    ruleset: tromp_taylor
+    scoring: area
+    suicide: illegal
+    superko: positional
+    pass_repetition_exempt: true
+zobrist:
+  seed: 20260710
+benchmark:
+  seed: 9001
+  games: 50
+  max_moves_per_game: 512
+
