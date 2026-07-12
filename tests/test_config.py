@@ -48,6 +48,17 @@ self_play:
   root_noise: true
 replay:
   capacity: 10000
+learner:
+  seed: 5301
+  batch_size: 32
+  steps: 10
+  learning_rate: 0.01
+  momentum: 0.9
+  weight_decay: 0.0001
+  value_loss_weight: 1.0
+  gradient_clip_norm: 5.0
+  checkpoint_interval: 5
+  augment: true
 {extra}""",
         encoding="utf-8",
     )
@@ -77,6 +88,16 @@ def test_load_config_composes_and_validates_yaml(tmp_path: Path) -> None:
     assert config.self_play.temperature_moves == 10
     assert config.self_play.root_noise is True
     assert config.replay.capacity == 10000
+    assert config.learner.seed == 5301
+    assert config.learner.batch_size == 32
+    assert config.learner.steps == 10
+    assert config.learner.learning_rate == 0.01
+    assert config.learner.momentum == 0.9
+    assert config.learner.weight_decay == 0.0001
+    assert config.learner.value_loss_weight == 1.0
+    assert config.learner.gradient_clip_norm == 5.0
+    assert config.learner.checkpoint_interval == 5
+    assert config.learner.augment is True
 
 
 @pytest.mark.parametrize("board_size", [5, 9, 13, 19])
@@ -98,6 +119,16 @@ def test_checked_in_engine_configurations_are_valid(board_size: int) -> None:
     assert config.self_play.temperature_moves == {5: 10, 9: 20, 13: 30, 19: 30}[board_size]
     assert config.self_play.root_noise is True
     assert config.replay.capacity == 10000
+    assert config.learner.seed == board_size * 1000 + 301
+    assert config.learner.batch_size == 32
+    assert config.learner.steps == 10
+    assert config.learner.learning_rate == 0.01
+    assert config.learner.momentum == 0.9
+    assert config.learner.weight_decay == 0.0001
+    assert config.learner.value_loss_weight == 1.0
+    assert config.learner.gradient_clip_norm == 5.0
+    assert config.learner.checkpoint_interval == 5
+    assert config.learner.augment is True
 
 
 def test_hydra_override_is_validated(tmp_path: Path) -> None:
@@ -418,6 +449,102 @@ def test_replay_configuration_is_required(tmp_path: Path) -> None:
     path = _write_config(tmp_path / "invalid.yaml")
     contents = path.read_text(encoding="utf-8")
     path.write_text(contents[: contents.index("replay:\n")], encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        ("seed: 5301", "seed: -1"),
+        ("seed: 5301", "seed: 18446744073709551616"),
+        ("seed: 5301", "seed: 5301.0"),
+        ("seed: 5301", "seed: true"),
+        ("batch_size: 32", "batch_size: 0"),
+        ("batch_size: 32", "batch_size: 32.0"),
+        ("batch_size: 32", "batch_size: true"),
+        ("steps: 10", "steps: 0"),
+        ("steps: 10", "steps: 10.0"),
+        ("learning_rate: 0.01", "learning_rate: 0.0"),
+        ("learning_rate: 0.01", "learning_rate: .inf"),
+        ("learning_rate: 0.01", "learning_rate: 1"),
+        ("momentum: 0.9", "momentum: -0.1"),
+        ("momentum: 0.9", "momentum: 1.0"),
+        ("momentum: 0.9", "momentum: .nan"),
+        ("momentum: 0.9", "momentum: 0"),
+        ("weight_decay: 0.0001", "weight_decay: -0.1"),
+        ("weight_decay: 0.0001", "weight_decay: .inf"),
+        ("weight_decay: 0.0001", "weight_decay: 0"),
+        ("value_loss_weight: 1.0", "value_loss_weight: 0.0"),
+        ("value_loss_weight: 1.0", "value_loss_weight: .nan"),
+        ("value_loss_weight: 1.0", "value_loss_weight: 1"),
+        ("gradient_clip_norm: 5.0", "gradient_clip_norm: 0.0"),
+        ("gradient_clip_norm: 5.0", "gradient_clip_norm: .inf"),
+        ("gradient_clip_norm: 5.0", "gradient_clip_norm: 5"),
+        ("checkpoint_interval: 5", "checkpoint_interval: 0"),
+        ("checkpoint_interval: 5", "checkpoint_interval: 5.0"),
+        ("augment: true", "augment: 1"),
+        ("augment: true", 'augment: "true"'),
+    ],
+)
+def test_invalid_learner_configuration_is_rejected(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(original, replacement),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement", "expected"),
+    [
+        ("momentum: 0.9", "momentum: 0.0", 0.0),
+        ("weight_decay: 0.0001", "weight_decay: 0.0", 0.0),
+    ],
+)
+def test_learner_nonnegative_float_endpoints_are_valid(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+    expected: float,
+) -> None:
+    path = _write_config(tmp_path / "valid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(original, replacement),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+    field = replacement.split(":", maxsplit=1)[0]
+    assert getattr(config.learner, field) == expected
+
+
+def test_unknown_learner_configuration_is_rejected(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "  augment: true",
+            "  augment: true\n  unknown: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_learner_configuration_is_required(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    contents = path.read_text(encoding="utf-8")
+    path.write_text(contents[: contents.index("learner:\n")], encoding="utf-8")
 
     with pytest.raises(ValidationError):
         load_config(path)

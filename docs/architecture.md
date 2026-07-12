@@ -6,25 +6,26 @@ tooling. Phase 2 provides an immutable Go rules engine and its tests. Phase 3
 adds deterministic feature encoding, square-board symmetries, and a CPU-first
 policy-value network. Phase 4 adds a validated evaluator boundary and
 deterministic, synchronous PUCT search. Phase 5 adds complete-game self-play
-generation and bounded, persistent replay storage. This document describes only
-those implemented boundaries.
+generation and bounded, persistent replay storage. Phase 6 adds deterministic
+CPU learning, portable training checkpoints, and checkpoint-backed evaluation.
+This document describes only those implemented boundaries.
 
 ## Current package boundaries
 
 ```text
-YAML ----> azgo.config <---- azgo.cli ----> azgo.replay
-                 |              |               ^
-                 |              v               |
-                 |        azgo.self_play --------+
-                 |          |       |
-                 |          v       v
-                 |     azgo.search  azgo.encoding ----> azgo.game
-                 |          |                              ^
-                 v          v                              |
-            azgo.network <- azgo.evaluator ----------------+
-                 ^
-                 |
-            azgo.symmetry <-------------------- azgo.replay
+YAML ----> azgo.config <---- azgo.cli ----> azgo.checkpoint
+                 |              |                 |
+                 |              v                 v
+                 |        azgo.learner ------> azgo.network
+                 |              ^                 ^
+                 |              |                 |
+                 |         azgo.replay      azgo.evaluator
+                 |              ^                 |
+                 |              |                 v
+                 +------> azgo.self_play ----> azgo.search ----> azgo.game
+                              |     |
+                              v     v
+                        azgo.encoding    azgo.symmetry
 ```
 
 ### `azgo.game`
@@ -62,15 +63,17 @@ non-finite komi, unsupported rulesets, malformed seeds, and invalid benchmark
 workloads fail before engine construction. Code outside this boundary consumes
 validated typed settings rather than unstructured dictionaries.
 
-The Phase 1-5 schema covers only implemented behavior: board size, komi,
+The Phase 1-6 schema covers only implemented behavior: board size, komi,
 ruleset, Zobrist seed, benchmark workload, encoding history length, residual
 trunk width and depth, value-head hidden size, and PUCT search settings. Search
 configuration includes a simulation count, exploration constant, unsigned
 64-bit random seed, and Dirichlet concentration and mixing fraction. Self-play
 configuration adds a seed, game batch size, safety move limit, temperature
 window, and root-noise switch. Replay configuration declares its position
-capacity. Learner, checkpoint, arena, and distributed settings are intentionally
-absent until their owning subsystems exist.
+capacity. Learner configuration adds a deterministic seed, batch and update
+counts, SGD hyperparameters, value-loss weight, gradient clip norm, checkpoint
+interval, and augmentation switch. Arena and distributed settings remain absent
+until their owning subsystems exist.
 
 ### `azgo.encoding` and `azgo.symmetry`
 
@@ -98,8 +101,8 @@ perspective. The CPU-first defaults are `H=8`, 64 channels, four residual
 blocks, and a 64-unit value hidden layer.
 
 The network validates its construction dimensions and input rank, channel
-count, and board dimensions. It does not own softmax, loss calculation,
-optimization, inference queues, checkpoints, or device orchestration.
+count, and board dimensions. It does not own loss calculation, optimization,
+inference queues, checkpoints, or device orchestration.
 
 ### `azgo.evaluator`
 
@@ -161,6 +164,32 @@ targets. Saving writes a temporary snapshot beside the destination and
 atomically replaces the target, so readers never observe a partially written
 archive.
 
+### `azgo.learner`
+
+`Learner` owns CPU SGD optimization and a monotonic global step. It samples
+replay positions without replacement using a seed derived from the configured
+learner seed and current step, optionally applying aligned D4 augmentation.
+Soft-target cross entropy trains the policy head, mean squared error trains the
+value head, and the weighted sum is backpropagated after strict batch and
+numerical validation. Gradients are clipped by the configured global norm.
+
+Each update returns detached scalar `TrainingMetrics`. A resumed learner
+restores its optimizer and global step before deriving the next replay seed,
+making split runs equivalent to uninterrupted runs under the same inputs and
+configuration.
+
+### `azgo.checkpoint`
+
+The checkpoint boundary persists an exact versioned payload containing model
+state, SGD optimizer state, global step, PyTorch RNG state, the full primitive
+configuration, and board/model/learner compatibility metadata. Writes use a
+same-directory temporary file, flush and sync it, then atomically replace the
+target. Loading uses CPU-mapped `weights_only=True`, rejects missing or extra
+fields, incompatible settings, unsafe values, and malformed or non-finite
+tensors before mutation. Inference restores model weights while preserving RNG;
+training resume restores model, optimizer, and RNG transactionally. Checkpoint
+files must still come from trusted sources.
+
 ### `azgo.cli`
 
 The Typer command line is a thin adapter. It loads validated settings, creates
@@ -169,14 +198,18 @@ invalid input. Business rules remain in `azgo.game`, and YAML parsing and
 validation remain in `azgo.config`.
 
 The current commands validate configuration, benchmark legal engine play,
-analyze a move with uniform-evaluator MCTS, and generate self-play replay data.
+analyze a move, generate self-play replay data, and train a network from replay.
 The benchmark uses an explicit random seed and configured workload so runs can
 be reproduced. `search-move` can reconstruct a state from repeatable row-major
 actions and optionally enable seeded root noise; it emits a machine-readable
-JSON search report. `generate-self-play` appends a complete configured batch to
+JSON search report. Search and self-play use uniform evaluation by default or a
+compatible checkpoint when `--checkpoint` is supplied. `generate-self-play`
+appends a complete configured batch to
 a compatible snapshot or starts over with `--overwrite`. It generates all games
 before mutating replay state and reports game outcomes and replay counts as
-JSON. Checkpoint loading remains deferred to a later milestone.
+JSON. `train-network` refuses implicit replacement, supports explicit fresh or
+resumed training, writes periodic and final checkpoints, and reports losses and
+step bounds as JSON.
 
 ## State and action data flow
 
@@ -213,6 +246,13 @@ player-to-move perspective. Replay preserves these canonical records in FIFO
 order and transforms aligned feature/policy pairs only when augmentation is
 requested during sampling.
 
+Training samples a deterministic replay batch for each global step, transforms
+the arrays to CPU tensors, computes policy and value losses, clips gradients,
+and updates the shared policy-value network. Checkpoints capture the model and
+optimizer after an update; a resumed command continues for the configured
+number of additional updates rather than treating that value as an absolute
+target step.
+
 ## Dependency and reproducibility rules
 
 - `azgo.game` must never import PyTorch or depend on a neural-network type.
@@ -226,11 +266,16 @@ requested during sampling.
   does not alter rule semantics or construct learner tensors.
 - `azgo.replay` stores validated self-play records and may use symmetry during
   sampling; neither the game engine nor search depends on replay.
+- `azgo.learner` consumes replay batches and owns optimization; replay and the
+  model do not depend on the learner.
+- `azgo.checkpoint` may consume model and optimizer state, but inference-facing
+  modules do not depend directly on checkpoint serialization.
 - Mutable process-wide singletons are not used for rules, configuration, or
   random-number generation.
 - Every stochastic operation accepts an explicit seed. Zobrist tables,
   benchmark action selection, optional root noise, self-play move selection,
-  and replay sampling are therefore reproducible.
+  replay sampling, network initialization, and training resume are therefore
+  reproducible.
 - YAML values are resolved and validated before they affect runtime behavior.
 - Public functions and methods are typed, and tests enforce immutable parent
   states and collision-safe rule behavior.
@@ -239,9 +284,9 @@ requested during sampling.
 
 ## Deferred AlphaZero subsystems
 
-Concurrent inference queues, learning, checkpoints, arenas, SGF export,
-observability, and distributed workers are outside the Phase 1-5 milestone.
-There are no placeholder implementations or configuration sections for them.
+Concurrent inference queues, arenas, SGF export, observability, and distributed
+workers are outside the Phase 1-6 milestone. There are no placeholder
+implementations or configuration sections for them.
 
 Their eventual dependency direction is constrained by the current boundary:
 they may consume the public Go engine, but the Go engine must not depend on

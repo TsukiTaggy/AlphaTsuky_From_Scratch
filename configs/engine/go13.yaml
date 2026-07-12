@@ -33,4 +33,15 @@ self_play:
   root_noise: true
 replay:
   capacity: 10000
+learner:
+  seed: 13301
+  batch_size: 32
+  steps: 10
+  learning_rate: 0.01
+  momentum: 0.9
+  weight_decay: 0.0001
+  value_loss_weight: 1.0
+  gradient_clip_norm: 5.0
+  checkpoint_interval: 5
+  augment: true
 

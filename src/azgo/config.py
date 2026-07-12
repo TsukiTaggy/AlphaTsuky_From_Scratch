@@ -22,6 +22,14 @@ UnitFiniteStrictFloat = Annotated[
     float,
     Field(strict=True, ge=0.0, le=1.0, allow_inf_nan=False),
 ]
+NonNegativeFiniteStrictFloat = Annotated[
+    float,
+    Field(strict=True, ge=0.0, allow_inf_nan=False),
+]
+MomentumFiniteStrictFloat = Annotated[
+    float,
+    Field(strict=True, ge=0.0, lt=1.0, allow_inf_nan=False),
+]
 SUPPORTED_BOARD_SIZES = frozenset({5, 9, 13, 19})
 
 
@@ -137,8 +145,41 @@ class ReplayConfig(BaseModel):
     capacity: PositiveStrictInt
 
 
+class LearnerConfig(BaseModel):
+    """Validated settings for deterministic CPU network optimization."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    seed: Seed
+    batch_size: PositiveStrictInt
+    steps: PositiveStrictInt
+    learning_rate: PositiveFiniteStrictFloat
+    momentum: MomentumFiniteStrictFloat
+    weight_decay: NonNegativeFiniteStrictFloat
+    value_loss_weight: PositiveFiniteStrictFloat
+    gradient_clip_norm: PositiveFiniteStrictFloat
+    checkpoint_interval: PositiveStrictInt
+    augment: StrictBool
+
+    @field_validator(
+        "learning_rate",
+        "momentum",
+        "weight_decay",
+        "value_loss_weight",
+        "gradient_clip_norm",
+        mode="before",
+    )
+    @classmethod
+    def require_float_scalars(cls, value: object) -> object:
+        """Reject integers and booleans at the strict YAML configuration boundary."""
+
+        if type(value) is not float:
+            raise ValueError("value must be a floating-point number")
+        return value
+
+
 class AppConfig(BaseModel):
-    """Complete validated configuration for Phases 1 through 5."""
+    """Complete validated configuration for Phases 1 through 6."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -149,6 +190,7 @@ class AppConfig(BaseModel):
     search: SearchConfig
     self_play: SelfPlayConfig
     replay: ReplayConfig
+    learner: LearnerConfig
 
 
 _APP_CONFIG_ADAPTER = TypeAdapter(AppConfig)
@@ -191,6 +233,6 @@ def validate_config(config: DictConfig) -> AppConfig:
 
 
 def load_config(path: str | Path, overrides: tuple[str, ...] = ()) -> AppConfig:
-    """Compose and validate a Phase 1-5 YAML configuration."""
+    """Compose and validate a Phase 1-6 YAML configuration."""
 
     return validate_config(compose_config(path, overrides))

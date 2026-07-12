@@ -1,16 +1,17 @@
 # alphazero-go
 
 `alphazero-go` is a correctness-first, research-oriented implementation of an
-AlphaZero-style Go system. The current Phase 1-5 milestone contains the Python
+AlphaZero-style Go system. The current Phase 1-6 milestone contains the Python
 project foundation, validated configuration, a PyTorch-independent Go rules
 engine, deterministic state encoding and board symmetries, and a CPU-first
-policy-value network with deterministic PUCT search, self-play generation, and
-bounded replay storage. It is usable on 5x5, 9x9, 13x13, and 19x19 boards.
+policy-value network with deterministic PUCT search, self-play generation,
+bounded replay storage, CPU training, and resumable checkpoints. It is usable
+on 5x5, 9x9, 13x13, and 19x19 boards.
 
 The longer-term project is intended to learn only from self-play and the rules
-of Go. Inference queues, neural training, model evaluation, checkpoint
-management, and distributed execution are not part of this milestone and are
-not represented by placeholder modules or configuration.
+of Go. Concurrent inference queues, arena-based model evaluation, and
+distributed execution are not part of this milestone and are not represented
+by placeholder modules or configuration.
 
 ## Requirements
 
@@ -55,8 +56,13 @@ uv run azgo search-move -c configs/engine/go5.yaml -m 0 -m 1 --root-noise
 ```
 
 The command emits JSON containing the selected row-major action and coordinate,
-root value, visit counts and policy, simulation count, and applied moves. It
-uses the deterministic `UniformEvaluator`; model checkpoint loading is deferred.
+root value, visit counts and policy, simulation count, applied moves, evaluator
+kind, and checkpoint step. It uses the deterministic `UniformEvaluator` by
+default. Pass a compatible trusted checkpoint to use the trained network:
+
+```console
+uv run azgo search-move -c configs/engine/go5.yaml --checkpoint checkpoints/go5.pt
+```
 
 Generate one configured batch of self-play games into a compressed replay
 snapshot:
@@ -70,7 +76,20 @@ indices. Pass `--overwrite` to start a new replay sequence at index zero. The
 command generates the complete requested batch before changing the buffer and
 saves through an atomic file replacement, so generation failures do not alter
 an existing snapshot. It uses `UniformEvaluator` as a correctness smoke path;
-Python callers may inject `TorchEvaluator` into `SelfPlayRunner`.
+pass `--checkpoint checkpoints/go5.pt` to generate games with a compatible
+trained model.
+
+Train the configured CPU network from a replay snapshot and create a checkpoint:
+
+```console
+uv run azgo train-network -c configs/engine/go5.yaml --replay data/go5.npz --checkpoint checkpoints/go5.pt
+```
+
+An existing destination is never replaced implicitly. Use `--overwrite` to
+start fresh or `--resume` to restore its model, SGD optimizer, global step, and
+random state, then run `learner.steps` additional updates. Search, self-play,
+and training checkpoints are serialized PyTorch artifacts: load checkpoints
+only from trusted sources.
 
 Equivalent validated configurations are provided at:
 
@@ -88,7 +107,7 @@ Pydantic models before an engine is constructed. Unknown fields and invalid
 values are rejected.
 
 The current YAML contract contains only settings owned by implemented Phase
-1-5 subsystems:
+1-6 subsystems:
 
 - `game.board_size`: one of `5`, `9`, `13`, or `19`
 - `game.komi`: a finite number added to White's score
@@ -116,6 +135,16 @@ The current YAML contract contains only settings owned by implemented Phase
 - `self_play.temperature_moves`: a nonnegative number of early sampled moves
 - `self_play.root_noise`: a strict boolean controlling root noise at each move
 - `replay.capacity`: a positive FIFO capacity counted in positions
+- `learner.seed`: an unsigned 64-bit seed for initialization and replay sampling
+- `learner.batch_size`: a positive number of positions per optimizer update
+- `learner.steps`: a positive number of additional updates per training command
+- `learner.learning_rate`: a finite positive SGD learning rate
+- `learner.momentum`: a finite SGD momentum in the half-open range `[0, 1)`
+- `learner.weight_decay`: a finite nonnegative SGD weight decay
+- `learner.value_loss_weight`: a finite positive value-loss multiplier
+- `learner.gradient_clip_norm`: a finite positive global gradient-norm limit
+- `learner.checkpoint_interval`: a positive periodic checkpoint interval
+- `learner.augment`: a strict boolean enabling seeded D4 replay augmentation
 
 The fixed rule fields are deliberately explicit in YAML. Changing one to an
 unsupported alternative fails validation instead of silently selecting
@@ -172,9 +201,8 @@ The CPU-first `azgo.network.PolicyValueNetwork` uses dimensions declared in
 the `model` section. Its default architecture uses a 64-channel convolutional
 stem, four residual blocks, and separate policy and value heads. Given a batch
 shaped `[B, 2H+1, N, N]`, it returns raw policy logits shaped `[B, N*N+1]` and
-`tanh` current-player values shaped `[B]`. Softmax, loss construction,
-optimization, batched inference services, and checkpoint management are
-intentionally left to later phases.
+`tanh` current-player values shaped `[B]`. Loss construction, optimization,
+batched inference services, and checkpoint persistence live outside the model.
 
 ## Evaluation and search
 
@@ -194,8 +222,7 @@ Search nodes retain complete immutable `GameState` histories because identical
 stone arrangements can have different positional-superko histories. The tree
 therefore does not merge transpositions. Call `advance(action)` to retain an
 explored child subtree after a move, or `reset(state)` to start from a new root.
-Concurrent inference queues, time-limited search, and checkpoint loading remain
-later-phase work.
+Concurrent inference queues and time-limited search remain later-phase work.
 
 ## Self-play and replay
 
@@ -224,12 +251,30 @@ dtypes, finiteness, probability normalization, and value bounds. Saving writes
 a temporary file in the target directory and atomically replaces the
 destination.
 
+## Learning and checkpoints
+
+`azgo.learner.Learner` performs deterministic CPU SGD updates from replay
+batches. Policy loss is soft-target cross entropy against MCTS visit policies;
+value loss is mean squared error against terminal current-player outcomes. The
+configured value weight combines them, then the configured global norm clips
+gradients before the optimizer step. Replay sampling is derived from the
+learner seed and global step, so resumed runs continue the same sample stream.
+
+`azgo.checkpoint` saves the model, optimizer, global step, full configuration,
+compatibility metadata, and PyTorch RNG state through atomic replacement.
+Inference loading restores only model weights; training resume also restores
+optimizer and PyTorch RNG state before continuing at the stored step. Loading
+uses PyTorch's restricted `weights_only=True` mode and validates exact fields,
+configuration compatibility, tensor shapes, scalar metadata, and finite
+numerical state before mutation. Still load checkpoint files only from sources
+you trust.
+
 See [Go rules](docs/game_rules.md) for the normative rule contract and
 [Architecture](docs/architecture.md) for package boundaries and data flow.
 
 ## Development and verification
 
-Run every Phase 1-5 quality gate from the repository root:
+Run every Phase 1-6 quality gate from the repository root:
 
 ```console
 uv run ruff check .
@@ -247,7 +292,10 @@ legal-only priors, deterministic PUCT selection and backup, seeded root noise,
 tree reuse, and search CLI behavior. Phase 5 coverage adds deterministic
 self-play, temperature selection, root-noise streams, terminal value targets,
 move-limit failure, FIFO eviction, replay sampling and augmentation, validated
-NPZ round trips, atomic saving, and the self-play CLI workflow.
+NPZ round trips, atomic saving, and the self-play CLI workflow. Phase 6 coverage
+adds learner loss and gradient validation, deterministic resume behavior,
+checkpoint compatibility and corruption handling, periodic/final checkpoint
+saving, and uniform versus checkpoint-backed CLI evaluation.
 
 The engine benchmark is intended for reproducible regression measurements.
 Profile evidence should precede internal optimization, and optimizations must
