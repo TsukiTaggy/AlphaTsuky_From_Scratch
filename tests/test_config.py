@@ -39,6 +39,15 @@ search:
   seed: 4242
   dirichlet_alpha: 0.3
   dirichlet_fraction: 0.25
+self_play:
+  seed: 4343
+  games: 2
+  max_moves: 256
+  temperature: 1.0
+  temperature_moves: 10
+  root_noise: true
+replay:
+  capacity: 10000
 {extra}""",
         encoding="utf-8",
     )
@@ -61,6 +70,13 @@ def test_load_config_composes_and_validates_yaml(tmp_path: Path) -> None:
     assert config.search.seed == 4242
     assert config.search.dirichlet_alpha == 0.3
     assert config.search.dirichlet_fraction == 0.25
+    assert config.self_play.seed == 4343
+    assert config.self_play.games == 2
+    assert config.self_play.max_moves == 256
+    assert config.self_play.temperature == 1.0
+    assert config.self_play.temperature_moves == 10
+    assert config.self_play.root_noise is True
+    assert config.replay.capacity == 10000
 
 
 @pytest.mark.parametrize("board_size", [5, 9, 13, 19])
@@ -75,6 +91,13 @@ def test_checked_in_engine_configurations_are_valid(board_size: int) -> None:
     assert config.search.simulations == 100
     assert config.search.dirichlet_alpha == (0.3 if board_size in {5, 9} else 0.03)
     assert config.search.dirichlet_fraction == 0.25
+    assert config.self_play.seed == board_size * 1000 + 201
+    assert config.self_play.games == 1
+    assert config.self_play.max_moves == {5: 256, 9: 512, 13: 768, 19: 1024}[board_size]
+    assert config.self_play.temperature == 1.0
+    assert config.self_play.temperature_moves == {5: 10, 9: 20, 13: 30, 19: 30}[board_size]
+    assert config.self_play.root_noise is True
+    assert config.replay.capacity == 10000
 
 
 def test_hydra_override_is_validated(tmp_path: Path) -> None:
@@ -276,6 +299,125 @@ def test_search_configuration_is_required(tmp_path: Path) -> None:
     path = _write_config(tmp_path / "invalid.yaml")
     contents = path.read_text(encoding="utf-8")
     path.write_text(contents[: contents.index("search:\n")], encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        ("seed: 4343", "seed: -1"),
+        ("seed: 4343", "seed: 18446744073709551616"),
+        ("seed: 4343", "seed: 4343.0"),
+        ("seed: 4343", "seed: true"),
+        ("games: 2", "games: 0"),
+        ("games: 2", "games: -1"),
+        ("games: 2", "games: 2.0"),
+        ("games: 2", "games: true"),
+        ("max_moves: 256", "max_moves: 1"),
+        ("max_moves: 256", "max_moves: 256.0"),
+        ("max_moves: 256", "max_moves: true"),
+        ("temperature: 1.0", "temperature: 0.0"),
+        ("temperature: 1.0", "temperature: -1.0"),
+        ("temperature: 1.0", "temperature: .inf"),
+        ("temperature: 1.0", "temperature: .nan"),
+        ("temperature: 1.0", "temperature: 1"),
+        ("temperature: 1.0", 'temperature: "1.0"'),
+        ("temperature_moves: 10", "temperature_moves: -1"),
+        ("temperature_moves: 10", "temperature_moves: 10.0"),
+        ("temperature_moves: 10", "temperature_moves: true"),
+        ("root_noise: true", "root_noise: 1"),
+        ("root_noise: true", 'root_noise: "true"'),
+    ],
+)
+def test_invalid_self_play_configuration_is_rejected(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(original, replacement),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize("temperature_moves", [0, 10])
+def test_temperature_moves_accepts_nonnegative_integers(
+    tmp_path: Path,
+    temperature_moves: int,
+) -> None:
+    path = _write_config(tmp_path / "valid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "temperature_moves: 10",
+            f"temperature_moves: {temperature_moves}",
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_config(path).self_play.temperature_moves == temperature_moves
+
+
+def test_unknown_self_play_configuration_is_rejected(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "  root_noise: true",
+            "  root_noise: true\n  unknown: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_self_play_configuration_is_required(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    contents = path.read_text(encoding="utf-8")
+    start = contents.index("self_play:\n")
+    end = contents.index("replay:\n")
+    path.write_text(contents[:start] + contents[end:], encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize("capacity", ["0", "-1", "10000.0", '"10000"', "true"])
+def test_invalid_replay_capacity_is_rejected(tmp_path: Path, capacity: str) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("capacity: 10000", f"capacity: {capacity}"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_unknown_replay_configuration_is_rejected(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "  capacity: 10000",
+            "  capacity: 10000\n  unknown: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_replay_configuration_is_required(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    contents = path.read_text(encoding="utf-8")
+    path.write_text(contents[: contents.index("replay:\n")], encoding="utf-8")
 
     with pytest.raises(ValidationError):
         load_config(path)

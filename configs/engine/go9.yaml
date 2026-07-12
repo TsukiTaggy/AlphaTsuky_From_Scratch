@@ -24,4 +24,13 @@ search:
   seed: 9101
   dirichlet_alpha: 0.3
   dirichlet_fraction: 0.25
+self_play:
+  seed: 9201
+  games: 1
+  max_moves: 512
+  temperature: 1.0
+  temperature_moves: 20
+  root_noise: true
+replay:
+  capacity: 10000
 

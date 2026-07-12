@@ -30,7 +30,7 @@ ConfigArgument = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-4 YAML configuration.",
+        help="Path to a Phase 1-5 YAML configuration.",
     ),
 ]
 ConfigOption = Annotated[
@@ -43,7 +43,7 @@ ConfigOption = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-4 YAML configuration.",
+        help="Path to a Phase 1-5 YAML configuration.",
     ),
 ]
 MovesOption = Annotated[
@@ -59,6 +59,24 @@ RootNoiseOption = Annotated[
     typer.Option(
         "--root-noise/--no-root-noise",
         help="Mix seeded Dirichlet noise into legal root priors.",
+    ),
+]
+OutputOption = Annotated[
+    Path,
+    typer.Option(
+        "--output",
+        "-o",
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Compressed NPZ replay snapshot to create or append.",
+    ),
+]
+OverwriteOption = Annotated[
+    bool,
+    typer.Option(
+        "--overwrite/--no-overwrite",
+        help="Replace an existing replay snapshot instead of appending to it.",
     ),
 ]
 
@@ -79,7 +97,7 @@ def _load_or_exit(path: Path) -> AppConfig:
 
 @app.command("validate-config")
 def validate_config_command(config: ConfigArgument) -> None:
-    """Compose and strictly validate a Phase 1-4 configuration."""
+    """Compose and strictly validate a Phase 1-5 configuration."""
 
     settings = _load_or_exit(config)
     typer.echo(json.dumps(settings.model_dump(mode="json"), indent=2, sort_keys=True))
@@ -107,6 +125,23 @@ def search_move(
         report = _run_search(settings, () if moves is None else moves, root_noise=root_noise)
     except _search_failures() as exc:
         typer.echo(f"Search failed: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+
+
+@app.command("generate-self-play")
+def generate_self_play(
+    config: ConfigOption,
+    output: OutputOption,
+    overwrite: OverwriteOption = False,
+) -> None:
+    """Generate deterministic uniform-evaluator games into a replay snapshot."""
+
+    settings = _load_or_exit(config)
+    try:
+        report = _run_self_play(settings, output, overwrite=overwrite)
+    except _self_play_failures() as exc:
+        typer.echo(f"Self-play failed: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
 
@@ -201,4 +236,78 @@ def _run_search(
         "simulations": int(result.simulations),
         "visit_counts": [int(count) for count in result.visit_counts],
         "visit_policy": [float(probability) for probability in result.visit_policy],
+    }
+
+
+def _self_play_failures() -> tuple[type[Exception], ...]:
+    """Return command-local self-play failures without loading them for other commands."""
+
+    from azgo.game import GoEngineError
+    from azgo.replay import ReplayError
+    from azgo.self_play import SelfPlayError
+
+    return (GoEngineError, ReplayError, SelfPlayError, OSError, ValueError)
+
+
+def _run_self_play(
+    settings: AppConfig,
+    output: Path,
+    *,
+    overwrite: bool,
+) -> dict[str, int | str]:
+    """Generate a complete game batch, then atomically update replay storage."""
+
+    from azgo.evaluator import UniformEvaluator
+    from azgo.game import Color
+    from azgo.replay import ReplayBuffer, ReplayError
+    from azgo.self_play import SelfPlayRunner
+
+    output = output.expanduser().resolve()
+    if output.exists() and not overwrite:
+        buffer = ReplayBuffer.load(output)
+        expected = (
+            settings.game.board_size,
+            settings.model.history_length,
+            settings.replay.capacity,
+        )
+        actual = (buffer.board_size, buffer.history_length, buffer.capacity)
+        if actual != expected:
+            raise ReplayError(
+                "existing replay metadata does not match configuration: "
+                f"expected board_size/history_length/capacity {expected}, got {actual}"
+            )
+    else:
+        buffer = ReplayBuffer(
+            board_size=settings.game.board_size,
+            history_length=settings.model.history_length,
+            capacity=settings.replay.capacity,
+        )
+
+    runner = SelfPlayRunner(UniformEvaluator(), settings)
+    first_game_index = buffer.next_game_index
+    games = [
+        runner.play_game(first_game_index + offset)
+        for offset in range(settings.self_play.games)
+    ]
+
+    positions_generated = sum(len(game.samples) for game in games)
+    black_wins = sum(game.winner is Color.BLACK for game in games)
+    white_wins = sum(game.winner is Color.WHITE for game in games)
+    draws = sum(game.winner is None for game in games)
+
+    for game in games:
+        buffer.add_game(game)
+    buffer.save(output)
+
+    return {
+        "black_wins": black_wins,
+        "board_size": settings.game.board_size,
+        "draws": draws,
+        "games_generated": len(games),
+        "next_game_index": buffer.next_game_index,
+        "output": str(output),
+        "positions_generated": positions_generated,
+        "replay_capacity": buffer.capacity,
+        "replay_size": len(buffer),
+        "white_wins": white_wins,
     }

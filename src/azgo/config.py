@@ -7,11 +7,13 @@ from typing import Annotated, Literal
 
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, field_validator
 
 BoardSize = Annotated[int, Field(strict=True)]
 Seed = Annotated[int, Field(strict=True, ge=0, le=(2**64) - 1)]
 PositiveStrictInt = Annotated[int, Field(strict=True, ge=1)]
+NonNegativeStrictInt = Annotated[int, Field(strict=True, ge=0)]
+MoveLimitStrictInt = Annotated[int, Field(strict=True, ge=2)]
 PositiveFiniteStrictFloat = Annotated[
     float,
     Field(strict=True, gt=0.0, allow_inf_nan=False),
@@ -105,8 +107,38 @@ class SearchConfig(BaseModel):
         return value
 
 
+class SelfPlayConfig(BaseModel):
+    """Validated settings for deterministic self-play generation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    seed: Seed
+    games: PositiveStrictInt
+    max_moves: MoveLimitStrictInt
+    temperature: PositiveFiniteStrictFloat
+    temperature_moves: NonNegativeStrictInt
+    root_noise: StrictBool
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def require_float_temperature(cls, value: object) -> object:
+        """Reject integers and booleans at the strict YAML boundary."""
+
+        if type(value) is not float:
+            raise ValueError("temperature must be a floating-point number")
+        return value
+
+
+class ReplayConfig(BaseModel):
+    """Validated settings for bounded position replay storage."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    capacity: PositiveStrictInt
+
+
 class AppConfig(BaseModel):
-    """Complete validated configuration for Phases 1 through 4."""
+    """Complete validated configuration for Phases 1 through 5."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -115,6 +147,8 @@ class AppConfig(BaseModel):
     benchmark: BenchmarkConfig
     model: ModelConfig
     search: SearchConfig
+    self_play: SelfPlayConfig
+    replay: ReplayConfig
 
 
 _APP_CONFIG_ADAPTER = TypeAdapter(AppConfig)
@@ -157,6 +191,6 @@ def validate_config(config: DictConfig) -> AppConfig:
 
 
 def load_config(path: str | Path, overrides: tuple[str, ...] = ()) -> AppConfig:
-    """Compose and validate a Phase 1-4 YAML configuration."""
+    """Compose and validate a Phase 1-5 YAML configuration."""
 
     return validate_config(compose_config(path, overrides))

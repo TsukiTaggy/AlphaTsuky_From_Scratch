@@ -1,12 +1,21 @@
 """Command-line integration tests."""
 
-import json
-from pathlib import Path
+from __future__ import annotations
 
+import json
+from typing import TYPE_CHECKING
+
+import numpy as np
 import pytest
 from typer.testing import CliRunner
 
 from azgo.cli import app
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from azgo.game import Color
+    from azgo.self_play import SelfPlayGame
 
 
 def _config(path: Path) -> Path:
@@ -38,6 +47,15 @@ search:
   seed: 4242
   dirichlet_alpha: 0.3
   dirichlet_fraction: 0.25
+self_play:
+  seed: 4343
+  games: 1
+  max_moves: 256
+  temperature: 1.0
+  temperature_moves: 10
+  root_noise: true
+replay:
+  capacity: 10000
 """,
         encoding="utf-8",
     )
@@ -55,6 +73,9 @@ def test_validate_config_command(tmp_path: Path) -> None:
     assert '"residual_blocks": 4' in result.output
     assert '"simulations": 8' in result.output
     assert '"dirichlet_fraction": 0.25' in result.output
+    assert '"max_moves": 256' in result.output
+    assert '"root_noise": true' in result.output
+    assert '"capacity": 10000' in result.output
     assert "Configuration is valid" in result.output
 
 
@@ -184,4 +205,216 @@ def test_search_move_command_reports_invalid_search_settings(tmp_path: Path) -> 
 
     assert result.exit_code == 2
     assert "Invalid configuration:" in result.output
+
+
+def _self_play_game(game_index: int, winner: Color | None) -> SelfPlayGame:
+    from azgo.game import Color, Score
+    from azgo.self_play import SelfPlayGame, TrainingSample
+
+    if winner is Color.BLACK:
+        black_stones, white_stones = 1, 0
+    elif winner is Color.WHITE:
+        black_stones, white_stones = 0, 1
+    else:
+        black_stones, white_stones = 0, 0
+    score = Score(
+        black_stones=black_stones,
+        white_stones=white_stones,
+        black_territory=0,
+        white_territory=0,
+        neutral_points=24,
+        komi=0.0,
+    )
+
+    samples = []
+    for move_number, to_play in enumerate((Color.BLACK, Color.WHITE)):
+        action = move_number
+        policy = np.zeros(26, dtype=np.float32)
+        policy[action] = 1.0
+        value = float(score.outcome(to_play))
+        samples.append(
+            TrainingSample(
+                features=np.zeros((17, 5, 5), dtype=np.float32),
+                policy=policy,
+                value=value,
+                to_play=to_play,
+                move_number=move_number,
+                selected_action=action,
+                game_index=game_index,
+            )
+        )
+    return SelfPlayGame(
+        samples=tuple(samples),
+        actions=(0, 1),
+        final_score=score,
+        winner=winner,
+        game_index=game_index,
+    )
+
+
+def _install_fake_self_play_runner(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    from azgo import self_play
+    from azgo.game import Color
+
+    calls: list[int] = []
+
+    class FakeRunner:
+        def __init__(self, evaluator: object, config: object) -> None:
+            del evaluator, config
+
+        def play_game(self, game_index: int) -> SelfPlayGame:
+            calls.append(game_index)
+            winners = (Color.BLACK, Color.WHITE, None)
+            return _self_play_game(game_index, winners[game_index % len(winners)])
+
+    monkeypatch.setattr(self_play, "SelfPlayRunner", FakeRunner)
+    return calls
+
+
+def test_generate_self_play_creates_snapshot_and_reports_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo.replay import ReplayBuffer
+
+    config = _config(tmp_path / "test.yaml")
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  games: 1\n  max_moves: 256",
+            "  games: 3\n  max_moves: 256",
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "nested" / "replay.npz"
+    calls = _install_fake_self_play_runner(monkeypatch)
+
+    result = CliRunner().invoke(
+        app,
+        ["generate-self-play", "-c", str(config), "-o", str(output)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [0, 1, 2]
+    report = json.loads(result.output)
+    assert report == {
+        "black_wins": 1,
+        "board_size": 5,
+        "draws": 1,
+        "games_generated": 3,
+        "next_game_index": 3,
+        "output": str(output.resolve()),
+        "positions_generated": 6,
+        "replay_capacity": 10000,
+        "replay_size": 6,
+        "white_wins": 1,
+    }
+    loaded = ReplayBuffer.load(output)
+    assert len(loaded) == 6
+    assert loaded.next_game_index == 3
+
+
+def test_generate_self_play_appends_and_overwrite_restarts_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo.replay import ReplayBuffer
+
+    config = _config(tmp_path / "test.yaml")
+    output = tmp_path / "replay.npz"
+    calls = _install_fake_self_play_runner(monkeypatch)
+    arguments = ["generate-self-play", "-c", str(config), "-o", str(output)]
+
+    first = CliRunner().invoke(app, arguments)
+    appended = CliRunner().invoke(app, [*arguments, "--no-overwrite"])
+
+    assert first.exit_code == 0, first.output
+    assert appended.exit_code == 0, appended.output
+    assert calls == [0, 1]
+    assert json.loads(appended.output)["next_game_index"] == 2
+    assert len(ReplayBuffer.load(output)) == 4
+
+    replaced = CliRunner().invoke(app, [*arguments, "--overwrite"])
+
+    assert replaced.exit_code == 0, replaced.output
+    assert calls == [0, 1, 0]
+    report = json.loads(replaced.output)
+    assert report["next_game_index"] == 1
+    assert report["replay_size"] == 2
+    assert len(ReplayBuffer.load(output)) == 2
+
+
+def test_generate_self_play_rejects_incompatible_existing_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo.replay import ReplayBuffer
+
+    config = _config(tmp_path / "test.yaml")
+    output = tmp_path / "replay.npz"
+    ReplayBuffer(board_size=9, history_length=8, capacity=10000).save(output)
+    original = output.read_bytes()
+    calls = _install_fake_self_play_runner(monkeypatch)
+
+    result = CliRunner().invoke(
+        app,
+        ["generate-self-play", "-c", str(config), "-o", str(output)],
+    )
+
+    assert result.exit_code == 2
+    assert "Self-play failed:" in result.output
+    assert "does not match configuration" in result.output
+    assert calls == []
+    assert output.read_bytes() == original
+
+
+def test_generate_self_play_reports_corrupt_snapshot_without_replacing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    output = tmp_path / "replay.npz"
+    original = b"not an npz snapshot"
+    output.write_bytes(original)
+    calls = _install_fake_self_play_runner(monkeypatch)
+
+    result = CliRunner().invoke(
+        app,
+        ["generate-self-play", "-c", str(config), "-o", str(output)],
+    )
+
+    assert result.exit_code == 2
+    assert "Self-play failed:" in result.output
+    assert calls == []
+    assert output.read_bytes() == original
+
+
+def test_generate_self_play_failure_does_not_mutate_existing_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo import self_play
+
+    config = _config(tmp_path / "test.yaml")
+    output = tmp_path / "replay.npz"
+    _install_fake_self_play_runner(monkeypatch)
+    arguments = ["generate-self-play", "-c", str(config), "-o", str(output)]
+    created = CliRunner().invoke(app, arguments)
+    assert created.exit_code == 0, created.output
+    original = output.read_bytes()
+
+    class FailingRunner:
+        def __init__(self, evaluator: object, settings: object) -> None:
+            del evaluator, settings
+
+        def play_game(self, game_index: int) -> SelfPlayGame:
+            raise self_play.SelfPlayLimitError(f"game {game_index} reached max_moves")
+
+    monkeypatch.setattr(self_play, "SelfPlayRunner", FailingRunner)
+
+    result = CliRunner().invoke(app, arguments)
+
+    assert result.exit_code == 2
+    assert "Self-play failed:" in result.output
+    assert "reached max_moves" in result.output
+    assert output.read_bytes() == original
 
