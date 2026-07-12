@@ -13,4 +13,15 @@ benchmark:
   seed: 5001
   games: 100
   max_moves_per_game: 256
+model:
+  history_length: 8
+  channels: 64
+  residual_blocks: 4
+  value_hidden_size: 64
+search:
+  simulations: 100
+  c_puct: 1.5
+  seed: 5101
+  dirichlet_alpha: 0.3
+  dirichlet_fraction: 0.25
 

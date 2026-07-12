@@ -1,14 +1,16 @@
 # alphazero-go
 
 `alphazero-go` is a correctness-first, research-oriented implementation of an
-AlphaZero-style Go system. The current Phase 1-2 milestone contains the Python
-project foundation, validated engine configuration, and a PyTorch-independent
-Go rules engine. It is usable on 5x5, 9x9, 13x13, and 19x19 boards.
+AlphaZero-style Go system. The current Phase 1-4 milestone contains the Python
+project foundation, validated configuration, a PyTorch-independent Go rules
+engine, deterministic state encoding and board symmetries, and a CPU-first
+policy-value network with deterministic PUCT search. It is usable on 5x5, 9x9,
+13x13, and 19x19 boards.
 
 The longer-term project is intended to learn only from self-play and the rules
-of Go. Neural networks, MCTS, self-play actors, replay storage, training,
-evaluation, and distributed execution are not part of this milestone and are
-not represented by placeholder modules or configuration.
+of Go. Inference queues, self-play actors, replay storage, training, model
+evaluation, checkpoint management, and distributed execution are not part of
+this milestone and are not represented by placeholder modules or configuration.
 
 ## Requirements
 
@@ -39,6 +41,23 @@ The benchmark reports JSON containing the board size, requested and completed
 games, seed, moves, elapsed time, and moves per second. Its configured maximum
 move count is a benchmark safety bound, not a Go termination rule.
 
+Analyze the empty board with deterministic uniform-evaluator search:
+
+```console
+uv run azgo search-move --config configs/engine/go5.yaml
+```
+
+Use repeatable `--move` options to reconstruct a position and opt into seeded
+root exploration noise when desired:
+
+```console
+uv run azgo search-move -c configs/engine/go5.yaml -m 0 -m 1 --root-noise
+```
+
+The command emits JSON containing the selected row-major action and coordinate,
+root value, visit counts and policy, simulation count, and applied moves. It
+uses the deterministic `UniformEvaluator`; model checkpoint loading is deferred.
+
 Equivalent validated configurations are provided at:
 
 - `configs/engine/go5.yaml`
@@ -54,7 +73,8 @@ Configuration is composed with Hydra/OmegaConf and validated with immutable
 Pydantic models before an engine is constructed. Unknown fields and invalid
 values are rejected.
 
-The current YAML contract contains only Phase 1-2 settings:
+The current YAML contract contains only settings owned by implemented Phase
+1-4 subsystems:
 
 - `game.board_size`: one of `5`, `9`, `13`, or `19`
 - `game.komi`: a finite number added to White's score
@@ -64,6 +84,16 @@ The current YAML contract contains only Phase 1-2 settings:
 - `benchmark.seed`: an unsigned 64-bit seed for random benchmark play
 - `benchmark.games`: a positive game count
 - `benchmark.max_moves_per_game`: a safety bound of at least two moves
+- `model.history_length`: a positive number of encoded board positions
+- `model.channels`: a positive residual-trunk channel count
+- `model.residual_blocks`: a positive residual-block count
+- `model.value_hidden_size`: a positive hidden size for the value head
+- `search.simulations`: a positive number of root simulations
+- `search.c_puct`: a finite positive PUCT exploration constant
+- `search.seed`: an unsigned 64-bit seed for optional root noise
+- `search.dirichlet_alpha`: a finite positive Dirichlet concentration
+- `search.dirichlet_fraction`: root-prior noise weight in the inclusive range
+  `[0, 1]`
 
 The fixed rule fields are deliberately explicit in YAML. Changing one to an
 unsupported alternative fails validation instead of silently selecting
@@ -101,12 +131,56 @@ Zobrist hashing is reproducible from its seed, but hashes never decide superko
 alone. Every candidate repetition is confirmed by an exact immutable-board
 comparison, so collisions cannot alter legality.
 
+## Encoding, symmetry, and network
+
+`azgo.encoding.encode_state` converts a `GameState` into a contiguous `float32`
+feature tensor shaped `[2H+1, N, N]`, where `H` is `history_length`.
+Newest-to-oldest history entries contribute a current-player stone plane and
+an opponent stone plane. Unavailable older history is zero-filled,
+pass-created duplicate boards remain represented, and the final plane is all
+ones for Black to play or all zeros for White. Tensor rows and columns use the
+same orientation as the engine's row-major action layout.
+
+`azgo.symmetry.Symmetry` exposes the eight D4 symmetries of a square board and
+can transform encoded features, board actions, and policy vectors. The pass
+action is invariant. Each transform has an exact inverse, so augmentation
+preserves feature/action alignment and policy probability mass.
+
+The CPU-first `azgo.network.PolicyValueNetwork` uses dimensions declared in
+the `model` section. Its default architecture uses a 64-channel convolutional
+stem, four residual blocks, and separate policy and value heads. Given a batch
+shaped `[B, 2H+1, N, N]`, it returns raw policy logits shaped `[B, N*N+1]` and
+`tanh` current-player values shaped `[B]`. Softmax, loss construction,
+optimization, batched inference services, and checkpoint management are
+intentionally left to later phases.
+
+## Evaluation and search
+
+`azgo.evaluator` defines a batch evaluator boundary returning policy logits and
+current-player values. `UniformEvaluator` supplies zero logits and values for
+deterministic engine-only searches, while `TorchEvaluator` adapts the Phase 3
+network under inference mode.
+
+`azgo.search.MCTS` performs synchronous, single-threaded PUCT search. It masks
+illegal actions, expands the root before counting simulations, uses exact game
+outcomes at terminal leaves, and backs values up with alternating perspective.
+Selection ties are resolved by the smallest action. Optional seeded Dirichlet
+noise is mixed into legal root priors only. Search results expose visit counts,
+their normalized policy, the selected action, and the root value.
+
+Search nodes retain complete immutable `GameState` histories because identical
+stone arrangements can have different positional-superko histories. The tree
+therefore does not merge transpositions. Call `advance(action)` to retain an
+explored child subtree after a move, or `reset(state)` to start from a new root.
+Concurrent inference queues, time-limited search, checkpoint loading, and
+self-play sampling remain later-phase work.
+
 See [Go rules](docs/game_rules.md) for the normative rule contract and
 [Architecture](docs/architecture.md) for package boundaries and data flow.
 
 ## Development and verification
 
-Run every Phase 1-2 quality gate from the repository root:
+Run every Phase 1-4 quality gate from the repository root:
 
 ```console
 uv run ruff check .
@@ -117,8 +191,11 @@ uv run pytest
 The test suite covers groups and liberties, captures, suicide, simple ko and
 longer superko, pass behavior, termination, scoring and komi, action encoding,
 legal masks, immutable parent states, deterministic and collision-safe hashes,
-random legal games, and property-based state invariants on every supported
-board size.
+random legal games, property-based state invariants, feature history and
+perspective, symmetry round trips, and policy-value forward/backward behavior
+on every supported board size. Phase 4 coverage adds evaluator validation,
+legal-only priors, deterministic PUCT selection and backup, seeded root noise,
+tree reuse, and search CLI behavior.
 
 The engine benchmark is intended for reproducible regression measurements.
 Profile evidence should precede internal optimization, and optimizations must

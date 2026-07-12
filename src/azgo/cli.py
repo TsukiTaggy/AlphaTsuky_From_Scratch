@@ -30,7 +30,7 @@ ConfigArgument = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-2 YAML configuration.",
+        help="Path to a Phase 1-4 YAML configuration.",
     ),
 ]
 ConfigOption = Annotated[
@@ -43,7 +43,22 @@ ConfigOption = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-2 YAML configuration.",
+        help="Path to a Phase 1-4 YAML configuration.",
+    ),
+]
+MovesOption = Annotated[
+    list[int] | None,
+    typer.Option(
+        "--move",
+        "-m",
+        help="Row-major action to apply before search; repeat for multiple moves.",
+    ),
+]
+RootNoiseOption = Annotated[
+    bool,
+    typer.Option(
+        "--root-noise/--no-root-noise",
+        help="Mix seeded Dirichlet noise into legal root priors.",
     ),
 ]
 
@@ -64,7 +79,7 @@ def _load_or_exit(path: Path) -> AppConfig:
 
 @app.command("validate-config")
 def validate_config_command(config: ConfigArgument) -> None:
-    """Compose and strictly validate a Phase 1-2 configuration."""
+    """Compose and strictly validate a Phase 1-4 configuration."""
 
     settings = _load_or_exit(config)
     typer.echo(json.dumps(settings.model_dump(mode="json"), indent=2, sort_keys=True))
@@ -77,6 +92,23 @@ def benchmark_engine(config: ConfigOption) -> None:
 
     settings = _load_or_exit(config)
     typer.echo(json.dumps(_run_engine_benchmark(settings), indent=2, sort_keys=True))
+
+
+@app.command("search-move")
+def search_move(
+    config: ConfigOption,
+    moves: MovesOption = None,
+    root_noise: RootNoiseOption = False,
+) -> None:
+    """Analyze a reconstructed position with synchronous uniform-evaluator MCTS."""
+
+    settings = _load_or_exit(config)
+    try:
+        report = _run_search(settings, () if moves is None else moves, root_noise=root_noise)
+    except _search_failures() as exc:
+        typer.echo(f"Search failed: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
 
 
 def _run_engine_benchmark(settings: AppConfig) -> dict[str, float | int]:
@@ -113,4 +145,60 @@ def _run_engine_benchmark(settings: AppConfig) -> dict[str, float | int]:
         "moves": total_moves,
         "moves_per_second": moves_per_second,
         "seed": settings.benchmark.seed,
+    }
+
+
+def _search_failures() -> tuple[type[Exception], ...]:
+    """Return command-local failure types without importing search for other commands."""
+
+    from azgo.game import GoEngineError
+    from azgo.search import SearchError
+
+    return (GoEngineError, SearchError, ValueError)
+
+
+def _run_search(
+    settings: AppConfig,
+    moves: list[int] | tuple[int, ...],
+    *,
+    root_noise: bool,
+) -> dict[str, bool | float | int | list[float] | list[int] | None]:
+    """Reconstruct one game and produce a JSON-compatible search report."""
+
+    from azgo.evaluator import UniformEvaluator
+    from azgo.game import GameState, Rules, Ruleset
+    from azgo.search import MCTS
+
+    rules = Rules(
+        board_size=settings.game.board_size,
+        komi=settings.game.komi,
+        ruleset=Ruleset(settings.game.rules.ruleset),
+    )
+    state = GameState.new(rules, zobrist_seed=settings.zobrist.seed)
+    applied_moves: list[int] = []
+    for action in moves:
+        state = state.apply(action)
+        applied_moves.append(action)
+
+    search = MCTS(
+        UniformEvaluator(),
+        simulations=settings.search.simulations,
+        c_puct=settings.search.c_puct,
+        seed=settings.search.seed,
+        dirichlet_alpha=settings.search.dirichlet_alpha,
+        dirichlet_fraction=settings.search.dirichlet_fraction,
+    )
+    result = search.run(state, add_root_noise=root_noise)
+    coordinate = state.action_to_coord(result.selected_action)
+    return {
+        "applied_moves": applied_moves,
+        "board_size": state.board_size,
+        "root_noise": root_noise,
+        "root_value": float(result.root_value),
+        "selected_action": int(result.selected_action),
+        "selected_coordinate": None if coordinate is None else list(coordinate),
+        "selected_is_pass": result.selected_action == state.pass_action,
+        "simulations": int(result.simulations),
+        "visit_counts": [int(count) for count in result.visit_counts],
+        "visit_policy": [float(probability) for probability in result.visit_policy],
     }

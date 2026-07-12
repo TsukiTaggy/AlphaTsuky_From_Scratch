@@ -1,9 +1,4 @@
-"""Composition and validation for the implemented project phases.
-
-The models in this module intentionally describe only the Go engine and its
-benchmark. Later AlphaZero subsystems add configuration when they are
-implemented rather than accepting unchecked placeholder settings here.
-"""
+"""Composition and validation for the implemented project phases."""
 
 from __future__ import annotations
 
@@ -16,6 +11,15 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 BoardSize = Annotated[int, Field(strict=True)]
 Seed = Annotated[int, Field(strict=True, ge=0, le=(2**64) - 1)]
+PositiveStrictInt = Annotated[int, Field(strict=True, ge=1)]
+PositiveFiniteStrictFloat = Annotated[
+    float,
+    Field(strict=True, gt=0.0, allow_inf_nan=False),
+]
+UnitFiniteStrictFloat = Annotated[
+    float,
+    Field(strict=True, ge=0.0, le=1.0, allow_inf_nan=False),
+]
 SUPPORTED_BOARD_SIZES = frozenset({5, 9, 13, 19})
 
 
@@ -69,14 +73,48 @@ class BenchmarkConfig(BaseModel):
     max_moves_per_game: int = Field(ge=2)
 
 
+class ModelConfig(BaseModel):
+    """Validated dimensions for state encoding and the policy-value network."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    history_length: PositiveStrictInt
+    channels: PositiveStrictInt
+    residual_blocks: PositiveStrictInt
+    value_hidden_size: PositiveStrictInt
+
+
+class SearchConfig(BaseModel):
+    """Validated settings for deterministic synchronous PUCT search."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    simulations: PositiveStrictInt
+    c_puct: PositiveFiniteStrictFloat
+    seed: Seed
+    dirichlet_alpha: PositiveFiniteStrictFloat
+    dirichlet_fraction: UnitFiniteStrictFloat
+
+    @field_validator("c_puct", "dirichlet_alpha", "dirichlet_fraction", mode="before")
+    @classmethod
+    def require_float_scalars(cls, value: object) -> object:
+        """Reject integers and booleans at the strict YAML configuration boundary."""
+
+        if type(value) is not float:
+            raise ValueError("value must be a floating-point number")
+        return value
+
+
 class AppConfig(BaseModel):
-    """Complete validated configuration for Phases 1 and 2."""
+    """Complete validated configuration for Phases 1 through 4."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     game: GameConfig
     zobrist: ZobristConfig
     benchmark: BenchmarkConfig
+    model: ModelConfig
+    search: SearchConfig
 
 
 _APP_CONFIG_ADAPTER = TypeAdapter(AppConfig)
@@ -119,6 +157,6 @@ def validate_config(config: DictConfig) -> AppConfig:
 
 
 def load_config(path: str | Path, overrides: tuple[str, ...] = ()) -> AppConfig:
-    """Compose and validate a Phase 1-2 YAML configuration."""
+    """Compose and validate a Phase 1-4 YAML configuration."""
 
     return validate_config(compose_config(path, overrides))
