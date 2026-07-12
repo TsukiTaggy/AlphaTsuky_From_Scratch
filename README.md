@@ -1,17 +1,18 @@
 # alphazero-go
 
 `alphazero-go` is a correctness-first, research-oriented implementation of an
-AlphaZero-style Go system. The current Phase 1-6 milestone contains the Python
+AlphaZero-style Go system. The current Phase 1-7 milestone contains the Python
 project foundation, validated configuration, a PyTorch-independent Go rules
 engine, deterministic state encoding and board symmetries, and a CPU-first
 policy-value network with deterministic PUCT search, self-play generation,
-bounded replay storage, CPU training, and resumable checkpoints. It is usable
-on 5x5, 9x9, 13x13, and 19x19 boards.
+bounded replay storage, CPU training, resumable checkpoints, and paired arena
+evaluation with explicit checkpoint promotion. It is usable on 5x5, 9x9,
+13x13, and 19x19 boards.
 
 The longer-term project is intended to learn only from self-play and the rules
-of Go. Concurrent inference queues, arena-based model evaluation, and
-distributed execution are not part of this milestone and are not represented
-by placeholder modules or configuration.
+of Go. Concurrent inference queues and distributed execution are not part of
+this milestone and are not represented by placeholder modules or
+configuration.
 
 ## Requirements
 
@@ -91,6 +92,30 @@ random state, then run `learner.steps` additional updates. Search, self-play,
 and training checkpoints are serialized PyTorch artifacts: load checkpoints
 only from trusted sources.
 
+Evaluate a candidate checkpoint against the current incumbent through paired,
+color-swapped arena games:
+
+```console
+uv run azgo evaluate-arena -c configs/engine/go5.yaml --candidate checkpoints/candidate.pt --incumbent checkpoints/best.pt
+```
+
+Each pair starts from the same seeded, model-independent legal opening. Arena
+play uses deterministic maximum-visit moves without root noise or temperature
+sampling. A win contributes one candidate point and a draw contributes one
+half; the candidate is promotion-eligible when its score meets the configured
+inclusive threshold. The JSON report includes checkpoint hashes and steps,
+aggregate results, and compact per-game evidence.
+
+Promotion is never implicit. Supplying an explicit destination atomically
+copies the evaluated candidate only when it passes the gate:
+
+```console
+uv run azgo evaluate-arena -c configs/engine/go5.yaml --candidate checkpoints/candidate.pt --incumbent checkpoints/best.pt --promote-to checkpoints/best.pt
+```
+
+If evaluation fails or the candidate misses the threshold, the destination is
+left unchanged.
+
 Equivalent validated configurations are provided at:
 
 - `configs/engine/go5.yaml`
@@ -107,7 +132,7 @@ Pydantic models before an engine is constructed. Unknown fields and invalid
 values are rejected.
 
 The current YAML contract contains only settings owned by implemented Phase
-1-6 subsystems:
+1-7 subsystems:
 
 - `game.board_size`: one of `5`, `9`, `13`, or `19`
 - `game.komi`: a finite number added to White's score
@@ -145,6 +170,11 @@ The current YAML contract contains only settings owned by implemented Phase
 - `learner.gradient_clip_norm`: a finite positive global gradient-norm limit
 - `learner.checkpoint_interval`: a positive periodic checkpoint interval
 - `learner.augment`: a strict boolean enabling seeded D4 replay augmentation
+- `arena.seed`: an unsigned 64-bit seed for deterministic paired openings
+- `arena.games`: a positive even number of color-balanced evaluation games
+- `arena.opening_moves`: a nonnegative number of seeded non-pass opening moves
+- `arena.max_moves`: a safety bound greater than the opening length
+- `arena.promotion_threshold`: a strict finite candidate score in `(0.5, 1]`
 
 The fixed rule fields are deliberately explicit in YAML. Changing one to an
 unsupported alternative fails validation instead of silently selecting
@@ -269,12 +299,28 @@ configuration compatibility, tensor shapes, scalar metadata, and finite
 numerical state before mutation. Still load checkpoint files only from sources
 you trust.
 
+## Arena evaluation and promotion
+
+`azgo.arena.ArenaRunner` compares candidate and incumbent evaluators without
+changing either checkpoint. It derives one legal non-pass opening per pair from
+the arena seed, then plays that position twice with checkpoint colors swapped.
+Both evaluator-specific MCTS trees advance through every action, preserving
+safe subtree reuse, while move selection remains noise-free and deterministic.
+
+Arena runs are all-or-nothing: an invalid opening, evaluator failure, or move
+limit aborts the evaluation rather than producing partial promotion evidence.
+Candidate score is `(wins + 0.5 * draws) / games`, and threshold equality
+passes. The CLI identifies both evaluated files by SHA-256 and rechecks the
+candidate while copying, so a checkpoint changed during evaluation cannot be
+promoted. Explicit promotion uses same-directory temporary storage, syncing,
+and atomic replacement.
+
 See [Go rules](docs/game_rules.md) for the normative rule contract and
 [Architecture](docs/architecture.md) for package boundaries and data flow.
 
 ## Development and verification
 
-Run every Phase 1-6 quality gate from the repository root:
+Run every Phase 1-7 quality gate from the repository root:
 
 ```console
 uv run ruff check .
@@ -296,6 +342,9 @@ NPZ round trips, atomic saving, and the self-play CLI workflow. Phase 6 coverage
 adds learner loss and gradient validation, deterministic resume behavior,
 checkpoint compatibility and corruption handling, periodic/final checkpoint
 saving, and uniform versus checkpoint-backed CLI evaluation.
+Phase 7 coverage adds deterministic paired openings, color balance, arena
+scoring and threshold decisions, compact reports, checkpoint identity checks,
+and atomic explicit promotion with failure-safe destination preservation.
 
 The engine benchmark is intended for reproducible regression measurements.
 Profile evidence should precede internal optimization, and optimizations must

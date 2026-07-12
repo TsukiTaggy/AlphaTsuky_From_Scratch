@@ -8,22 +8,23 @@ policy-value network. Phase 4 adds a validated evaluator boundary and
 deterministic, synchronous PUCT search. Phase 5 adds complete-game self-play
 generation and bounded, persistent replay storage. Phase 6 adds deterministic
 CPU learning, portable training checkpoints, and checkpoint-backed evaluation.
-This document describes only those implemented boundaries.
+Phase 7 adds paired arena evaluation and explicit checkpoint promotion. This
+document describes only those implemented boundaries.
 
 ## Current package boundaries
 
 ```text
 YAML ----> azgo.config <---- azgo.cli ----> azgo.checkpoint
                  |              |                 |
-                 |              v                 v
-                 |        azgo.learner ------> azgo.network
-                 |              ^                 ^
-                 |              |                 |
-                 |         azgo.replay      azgo.evaluator
-                 |              ^                 |
                  |              |                 v
-                 +------> azgo.self_play ----> azgo.search ----> azgo.game
-                              |     |
+                 |              +----------> azgo.network ----> azgo.evaluator
+                 |              |                 ^                   |
+                 |              +----> azgo.learner <---- azgo.replay |
+                 |              |                                     v
+                 |              +----> azgo.arena ------------> azgo.search
+                 |                                      +-------------+ |
+                 +------> azgo.self_play <---------------+               v
+                              |     |                              azgo.game
                               v     v
                         azgo.encoding    azgo.symmetry
 ```
@@ -63,7 +64,7 @@ non-finite komi, unsupported rulesets, malformed seeds, and invalid benchmark
 workloads fail before engine construction. Code outside this boundary consumes
 validated typed settings rather than unstructured dictionaries.
 
-The Phase 1-6 schema covers only implemented behavior: board size, komi,
+The Phase 1-7 schema covers only implemented behavior: board size, komi,
 ruleset, Zobrist seed, benchmark workload, encoding history length, residual
 trunk width and depth, value-head hidden size, and PUCT search settings. Search
 configuration includes a simulation count, exploration constant, unsigned
@@ -72,8 +73,10 @@ configuration adds a seed, game batch size, safety move limit, temperature
 window, and root-noise switch. Replay configuration declares its position
 capacity. Learner configuration adds a deterministic seed, batch and update
 counts, SGD hyperparameters, value-loss weight, gradient clip norm, checkpoint
-interval, and augmentation switch. Arena and distributed settings remain absent
-until their owning subsystems exist.
+interval, and augmentation switch. Arena configuration adds a deterministic
+seed, even game count, opening length, game safety bound, and promotion score
+threshold. Concurrent-inference and distributed settings remain absent until
+their owning subsystems exist.
 
 ### `azgo.encoding` and `azgo.symmetry`
 
@@ -190,6 +193,22 @@ tensors before mutation. Inference restores model weights while preserving RNG;
 training resume restores model, optimizer, and RNG transactionally. Checkpoint
 files must still come from trusted sources.
 
+### `azgo.arena`
+
+The arena compares candidate and incumbent evaluators through an even number of
+games. Each pair starts from one model-independent sequence of seeded legal
+non-pass actions, then plays that same position twice with evaluator colors
+swapped. Arena moves use maximum MCTS visit counts without root noise or
+temperature sampling. Each evaluator owns a reusable tree, and both trees
+advance through every action so they remain synchronized with the complete
+superko-aware game state.
+
+An immutable result records compact per-game evidence and aggregate candidate
+wins, incumbent wins, draws, points, and score. Wins count as one point, draws
+as one half, and equality with the configured threshold is promotion-eligible.
+Opening, search, evaluator, and move-limit failures abort the entire run; the
+arena itself never mutates checkpoint files.
+
 ### `azgo.cli`
 
 The Typer command line is a thin adapter. It loads validated settings, creates
@@ -198,7 +217,8 @@ invalid input. Business rules remain in `azgo.game`, and YAML parsing and
 validation remain in `azgo.config`.
 
 The current commands validate configuration, benchmark legal engine play,
-analyze a move, generate self-play replay data, and train a network from replay.
+analyze a move, generate self-play replay data, train a network from replay, and
+evaluate candidate checkpoints in the arena.
 The benchmark uses an explicit random seed and configured workload so runs can
 be reproduced. `search-move` can reconstruct a state from repeatable row-major
 actions and optionally enable seeded root noise; it emits a machine-readable
@@ -209,7 +229,11 @@ a compatible snapshot or starts over with `--overwrite`. It generates all games
 before mutating replay state and reports game outcomes and replay counts as
 JSON. `train-network` refuses implicit replacement, supports explicit fresh or
 resumed training, writes periodic and final checkpoints, and reports losses and
-step bounds as JSON.
+step bounds as JSON. `evaluate-arena` loads two compatible checkpoints into
+independent evaluators and reports their steps, SHA-256 identities, aggregate
+decision, and compact games. Promotion occurs only with an explicit destination
+and uses a revalidated, same-directory atomic copy; an ineligible or failed run
+does not alter that destination.
 
 ## State and action data flow
 
@@ -253,6 +277,12 @@ optimizer after an update; a resumed command continues for the configured
 number of additional updates rather than treating that value as an absolute
 target step.
 
+Arena opening generation depends only on the validated rules, arena seed, and
+pair index. Both games in a pair therefore begin from exactly the same state,
+while swapping evaluator colors controls first-player and komi bias. Promotion
+copies the candidate only after all games complete and the aggregate score
+passes the inclusive threshold.
+
 ## Dependency and reproducibility rules
 
 - `azgo.game` must never import PyTorch or depend on a neural-network type.
@@ -270,6 +300,8 @@ target step.
   model do not depend on the learner.
 - `azgo.checkpoint` may consume model and optimizer state, but inference-facing
   modules do not depend directly on checkpoint serialization.
+- `azgo.arena` consumes evaluator, search, and immutable game APIs; it does not
+  load, save, or promote checkpoints itself.
 - Mutable process-wide singletons are not used for rules, configuration, or
   random-number generation.
 - Every stochastic operation accepts an explicit seed. Zobrist tables,
@@ -284,8 +316,8 @@ target step.
 
 ## Deferred AlphaZero subsystems
 
-Concurrent inference queues, arenas, SGF export, observability, and distributed
-workers are outside the Phase 1-6 milestone. There are no placeholder
+Concurrent inference queues, SGF export, observability, and distributed workers
+are outside the Phase 1-7 milestone. There are no placeholder
 implementations or configuration sections for them.
 
 Their eventual dependency direction is constrained by the current boundary:

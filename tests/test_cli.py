@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -13,6 +16,8 @@ from typer.testing import CliRunner
 from azgo.cli import app
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from azgo.game import Color
     from azgo.self_play import SelfPlayGame
 
@@ -66,6 +71,12 @@ learner:
   gradient_clip_norm: 5.0
   checkpoint_interval: 1
   augment: true
+arena:
+  seed: 5401
+  games: 4
+  opening_moves: 4
+  max_moves: 256
+  promotion_threshold: 0.55
 """,
         encoding="utf-8",
     )
@@ -905,4 +916,427 @@ def test_commands_report_malformed_checkpoint(
 
     assert result.exit_code == 2
     assert prefix in result.output
+
+
+def _fake_arena_result(
+    *,
+    eligible: bool = True,
+    candidate_score: float = 0.625,
+    promotion_threshold: float = 0.55,
+) -> SimpleNamespace:
+    from azgo.game import Color, Score
+
+    black_win = Score(1, 0, 0, 0, 24, 0.0)
+    white_win = Score(0, 1, 0, 0, 24, 0.0)
+    draw = Score(0, 0, 0, 0, 25, 0.0)
+    games = (
+        SimpleNamespace(
+            pair_index=0,
+            game_index=0,
+            candidate_color=Color.BLACK,
+            opening_actions=(0, 1),
+            move_count=10,
+            final_score=black_win,
+            winner=Color.BLACK,
+            candidate_outcome="win",
+        ),
+        SimpleNamespace(
+            pair_index=0,
+            game_index=1,
+            candidate_color=Color.WHITE,
+            opening_actions=(0, 1),
+            move_count=11,
+            final_score=draw,
+            winner=None,
+            candidate_outcome="draw",
+        ),
+        SimpleNamespace(
+            pair_index=1,
+            game_index=2,
+            candidate_color=Color.BLACK,
+            opening_actions=(2, 3),
+            move_count=12,
+            final_score=white_win,
+            winner=Color.WHITE,
+            candidate_outcome="loss",
+        ),
+        SimpleNamespace(
+            pair_index=1,
+            game_index=3,
+            candidate_color=Color.WHITE,
+            opening_actions=(2, 3),
+            move_count=13,
+            final_score=white_win,
+            winner=Color.WHITE,
+            candidate_outcome="win",
+        ),
+    )
+    return SimpleNamespace(
+        games=games,
+        candidate_wins=2,
+        incumbent_wins=1,
+        draws=1,
+        candidate_points=2.5,
+        candidate_score=candidate_score,
+        promotion_threshold=promotion_threshold,
+        promotion_eligible=eligible,
+    )
+
+
+def _install_fake_arena(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    result: SimpleNamespace | None = None,
+    load_error: Exception | None = None,
+    on_run: Callable[[], object] | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    from azgo import arena as arena_module
+    from azgo import checkpoint as checkpoint_module
+    from azgo import cli as cli_module
+    from azgo import evaluator as evaluator_module
+    from azgo.checkpoint import CheckpointMetadata
+
+    loads: list[dict[str, object]] = []
+    runners: list[dict[str, object]] = []
+    networks: list[object] = []
+    arena_result = _fake_arena_result() if result is None else result
+
+    def fake_build_network(settings: object) -> object:
+        del settings
+        network = object()
+        networks.append(network)
+        return network
+
+    def fake_load_checkpoint(
+        path: str | Path,
+        *,
+        network: object,
+        config: object,
+        optimizer: object | None = None,
+        restore_rng: bool | None = None,
+    ) -> CheckpointMetadata:
+        del config
+        loads.append(
+            {
+                "network": network,
+                "optimizer": optimizer,
+                "path": Path(path),
+                "restore_rng": restore_rng,
+            }
+        )
+        if load_error is not None:
+            raise load_error
+        return CheckpointMetadata(step=10 + len(loads), config={})
+
+    class FakeArenaRunner:
+        def __init__(
+            self,
+            candidate_evaluator: object,
+            incumbent_evaluator: object,
+            config: object,
+        ) -> None:
+            runners.append(
+                {
+                    "candidate": candidate_evaluator,
+                    "config": config,
+                    "incumbent": incumbent_evaluator,
+                }
+            )
+
+        def run(self) -> SimpleNamespace:
+            if on_run is not None:
+                on_run()
+            return arena_result
+
+    monkeypatch.setattr(cli_module, "_build_network", fake_build_network)
+    monkeypatch.setattr(checkpoint_module, "load_checkpoint", fake_load_checkpoint)
+    monkeypatch.setattr(evaluator_module, "TorchEvaluator", lambda network: network)
+    monkeypatch.setattr(arena_module, "ArenaRunner", FakeArenaRunner)
+    return loads, runners
+
+
+def _arena_command(
+    config: Path,
+    candidate: Path,
+    incumbent: Path,
+    promote_to: Path | None = None,
+) -> list[str]:
+    command = [
+        "evaluate-arena",
+        "-c",
+        str(config),
+        "--candidate",
+        str(candidate),
+        "--incumbent",
+        str(incumbent),
+    ]
+    if promote_to is not None:
+        command.extend(("--promote-to", str(promote_to)))
+    return command
+
+
+def test_evaluate_arena_reports_identities_results_and_compact_games(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    candidate.write_bytes(b"candidate checkpoint")
+    incumbent.write_bytes(b"incumbent checkpoint")
+    loads, runners = _install_fake_arena(monkeypatch)
+
+    result = CliRunner().invoke(app, _arena_command(config, candidate, incumbent))
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    assert report["candidate"] == str(candidate.resolve())
+    assert report["candidate_sha256"] == sha256(candidate.read_bytes()).hexdigest()
+    assert report["candidate_step"] == 11
+    assert report["incumbent"] == str(incumbent.resolve())
+    assert report["incumbent_sha256"] == sha256(incumbent.read_bytes()).hexdigest()
+    assert report["incumbent_step"] == 12
+    assert report["candidate_wins"] == 2
+    assert report["incumbent_wins"] == 1
+    assert report["draws"] == 1
+    assert report["candidate_points"] == 2.5
+    assert report["candidate_score"] == 0.625
+    assert report["promotion_threshold"] == 0.55
+    assert report["promotion_eligible"] is True
+    assert report["promotion_requested"] is False
+    assert report["promoted"] is False
+    assert report["promoted_to"] is None
+    assert report["games_played"] == 4
+    assert report["games"][0] == {
+        "black_score": 1.0,
+        "candidate_color": "black",
+        "candidate_outcome": "win",
+        "game_index": 0,
+        "move_count": 10,
+        "opening_actions": [0, 1],
+        "pair_index": 0,
+        "white_score": 0.0,
+        "winner": "black",
+    }
+    assert report["games"][1]["winner"] is None
+    assert len(loads) == 2
+    assert loads[0]["network"] is not loads[1]["network"]
+    assert all(load["optimizer"] is None for load in loads)
+    assert all(load["restore_rng"] is False for load in loads)
+    assert len(runners) == 1
+    assert runners[0]["candidate"] is loads[0]["network"]
+    assert runners[0]["incumbent"] is loads[1]["network"]
+
+
+@pytest.mark.parametrize(
+    ("eligible", "score", "promoted"),
+    [(False, 0.5, False), (True, 0.55, True)],
+)
+def test_evaluate_arena_promotes_only_when_eligible_including_threshold_equality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    eligible: bool,
+    score: float,
+    promoted: bool,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    destination = tmp_path / "nested" / "best.pt"
+    candidate_bytes = b"candidate checkpoint"
+    original = b"original destination"
+    candidate.write_bytes(candidate_bytes)
+    incumbent.write_bytes(b"incumbent checkpoint")
+    destination.parent.mkdir()
+    destination.write_bytes(original)
+    arena_result = _fake_arena_result(
+        eligible=eligible,
+        candidate_score=score,
+        promotion_threshold=0.55,
+    )
+    _install_fake_arena(monkeypatch, result=arena_result)
+
+    result = CliRunner().invoke(
+        app,
+        _arena_command(config, candidate, incumbent, destination),
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    assert report["promotion_eligible"] is eligible
+    assert report["promotion_requested"] is True
+    assert report["promoted"] is promoted
+    assert report["promoted_to"] == (str(destination.resolve()) if promoted else None)
+    assert destination.read_bytes() == (candidate_bytes if promoted else original)
+    assert list(destination.parent.glob(f".{destination.name}.*.tmp")) == []
+
+
+def test_evaluate_arena_allows_promotion_over_incumbent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    candidate.write_bytes(b"candidate checkpoint")
+    incumbent.write_bytes(b"incumbent checkpoint")
+    _install_fake_arena(monkeypatch)
+
+    result = CliRunner().invoke(
+        app,
+        _arena_command(config, candidate, incumbent, incumbent),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert incumbent.read_bytes() == candidate.read_bytes()
+    assert json.loads(result.output)["promoted_to"] == str(incumbent.resolve())
+
+
+@pytest.mark.parametrize("same_role", ["incumbent", "promotion"])
+def test_evaluate_arena_rejects_candidate_path_reuse(
+    tmp_path: Path,
+    same_role: str,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    candidate.write_bytes(b"candidate checkpoint")
+    incumbent.write_bytes(b"incumbent checkpoint")
+    command = _arena_command(
+        config,
+        candidate,
+        candidate if same_role == "incumbent" else incumbent,
+        candidate if same_role == "promotion" else None,
+    )
+
+    result = CliRunner().invoke(app, command)
+
+    assert result.exit_code == 2
+    assert "Arena evaluation failed:" in result.output
+    assert "candidate" in result.output
+
+
+def test_evaluate_arena_reports_missing_checkpoint(tmp_path: Path) -> None:
+    config = _config(tmp_path / "test.yaml")
+    incumbent = tmp_path / "incumbent.pt"
+    incumbent.write_bytes(b"incumbent checkpoint")
+
+    result = CliRunner().invoke(
+        app,
+        _arena_command(config, tmp_path / "missing.pt", incumbent),
+    )
+
+    assert result.exit_code == 2
+    assert "Arena evaluation failed:" in result.output
+
+
+@pytest.mark.parametrize("message", ["malformed checkpoint", "incompatible checkpoint"])
+def test_evaluate_arena_reports_checkpoint_load_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+) -> None:
+    from azgo.checkpoint import CheckpointError
+
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    candidate.write_bytes(b"candidate checkpoint")
+    incumbent.write_bytes(b"incumbent checkpoint")
+    _install_fake_arena(monkeypatch, load_error=CheckpointError(message))
+
+    result = CliRunner().invoke(app, _arena_command(config, candidate, incumbent))
+
+    assert result.exit_code == 2
+    assert "Arena evaluation failed:" in result.output
+    assert message in result.output
+
+
+def test_evaluate_arena_rejects_candidate_changed_during_arena(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    destination = tmp_path / "best.pt"
+    candidate.write_bytes(b"candidate checkpoint")
+    incumbent.write_bytes(b"incumbent checkpoint")
+    destination.write_bytes(b"original destination")
+    _install_fake_arena(
+        monkeypatch,
+        on_run=lambda: candidate.write_bytes(b"changed candidate"),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        _arena_command(config, candidate, incumbent, destination),
+    )
+
+    assert result.exit_code == 2
+    assert "changed after arena evaluation" in result.output
+    assert destination.read_bytes() == b"original destination"
+    assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
+
+
+def test_evaluate_arena_failure_does_not_touch_promotion_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo.arena import ArenaLimitError
+
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    destination = tmp_path / "best.pt"
+    candidate.write_bytes(b"candidate checkpoint")
+    incumbent.write_bytes(b"incumbent checkpoint")
+    destination.write_bytes(b"original destination")
+
+    def fail_arena() -> None:
+        raise ArenaLimitError("synthetic move-limit failure")
+
+    _install_fake_arena(monkeypatch, on_run=fail_arena)
+
+    result = CliRunner().invoke(
+        app,
+        _arena_command(config, candidate, incumbent, destination),
+    )
+
+    assert result.exit_code == 2
+    assert "synthetic move-limit failure" in result.output
+    assert destination.read_bytes() == b"original destination"
+    assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
+
+
+@pytest.mark.parametrize("failure", ["fsync", "replace"])
+def test_evaluate_arena_promotion_failure_preserves_destination_and_cleans_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    destination = tmp_path / "best.pt"
+    candidate.write_bytes(b"candidate checkpoint")
+    incumbent.write_bytes(b"incumbent checkpoint")
+    destination.write_bytes(b"original destination")
+    _install_fake_arena(monkeypatch)
+
+    def fail(*args: object) -> None:
+        del args
+        raise OSError(f"synthetic {failure} failure")
+
+    monkeypatch.setattr(os, failure, fail)
+
+    result = CliRunner().invoke(
+        app,
+        _arena_command(config, candidate, incumbent, destination),
+    )
+
+    assert result.exit_code == 2
+    assert f"synthetic {failure} failure" in result.output
+    assert destination.read_bytes() == b"original destination"
+    assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
 

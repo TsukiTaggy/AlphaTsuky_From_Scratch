@@ -312,8 +312,13 @@ def _validate_payload(
     if type(saved_config) is not dict:
         raise CheckpointError("checkpoint config must be a dictionary")
     _validate_primitive(saved_config, "config")
+    typed_saved_config = cast("dict[str, object]", saved_config)
+    config_for_validation = typed_saved_config
+    if "arena" not in typed_saved_config:
+        config_for_validation = copy.deepcopy(typed_saved_config)
+        config_for_validation["arena"] = config.arena.model_dump(mode="json")
     try:
-        validated_saved_config = AppConfig.model_validate(saved_config)
+        validated_saved_config = AppConfig.model_validate(config_for_validation)
     except ValidationError as exc:
         raise CheckpointError(f"checkpoint config is invalid: {exc}") from exc
 

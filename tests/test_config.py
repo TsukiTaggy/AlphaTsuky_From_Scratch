@@ -59,6 +59,12 @@ learner:
   gradient_clip_norm: 5.0
   checkpoint_interval: 5
   augment: true
+arena:
+  seed: 5401
+  games: 4
+  opening_moves: 4
+  max_moves: 128
+  promotion_threshold: 0.55
 {extra}""",
         encoding="utf-8",
     )
@@ -98,6 +104,11 @@ def test_load_config_composes_and_validates_yaml(tmp_path: Path) -> None:
     assert config.learner.gradient_clip_norm == 5.0
     assert config.learner.checkpoint_interval == 5
     assert config.learner.augment is True
+    assert config.arena.seed == 5401
+    assert config.arena.games == 4
+    assert config.arena.opening_moves == 4
+    assert config.arena.max_moves == 128
+    assert config.arena.promotion_threshold == 0.55
 
 
 @pytest.mark.parametrize("board_size", [5, 9, 13, 19])
@@ -129,6 +140,11 @@ def test_checked_in_engine_configurations_are_valid(board_size: int) -> None:
     assert config.learner.gradient_clip_norm == 5.0
     assert config.learner.checkpoint_interval == 5
     assert config.learner.augment is True
+    assert config.arena.seed == board_size * 1000 + 401
+    assert config.arena.games == 4
+    assert config.arena.opening_moves == {5: 4, 9: 8, 13: 12, 19: 16}[board_size]
+    assert config.arena.max_moves == {5: 256, 9: 512, 13: 768, 19: 1024}[board_size]
+    assert config.arena.promotion_threshold == 0.55
 
 
 def test_hydra_override_is_validated(tmp_path: Path) -> None:
@@ -545,6 +561,130 @@ def test_learner_configuration_is_required(tmp_path: Path) -> None:
     path = _write_config(tmp_path / "invalid.yaml")
     contents = path.read_text(encoding="utf-8")
     path.write_text(contents[: contents.index("learner:\n")], encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        ("seed: 5401", "seed: -1"),
+        ("seed: 5401", "seed: 18446744073709551616"),
+        ("seed: 5401", "seed: 5401.0"),
+        ("seed: 5401", 'seed: "5401"'),
+        ("seed: 5401", "seed: true"),
+        ("games: 4", "games: 0"),
+        ("games: 4", "games: -2"),
+        ("games: 4", "games: 1"),
+        ("games: 4", "games: 3"),
+        ("games: 4", "games: 4.0"),
+        ("games: 4", 'games: "4"'),
+        ("games: 4", "games: true"),
+        ("opening_moves: 4", "opening_moves: -1"),
+        ("opening_moves: 4", "opening_moves: 4.0"),
+        ("opening_moves: 4", 'opening_moves: "4"'),
+        ("opening_moves: 4", "opening_moves: true"),
+        ("max_moves: 128", "max_moves: 0"),
+        ("max_moves: 128", "max_moves: 1"),
+        ("max_moves: 128", "max_moves: 128.0"),
+        ("max_moves: 128", 'max_moves: "128"'),
+        ("max_moves: 128", "max_moves: true"),
+        ("promotion_threshold: 0.55", "promotion_threshold: 0.5"),
+        ("promotion_threshold: 0.55", "promotion_threshold: 0.49"),
+        ("promotion_threshold: 0.55", "promotion_threshold: 1.01"),
+        ("promotion_threshold: 0.55", "promotion_threshold: .inf"),
+        ("promotion_threshold: 0.55", "promotion_threshold: -.inf"),
+        ("promotion_threshold: 0.55", "promotion_threshold: .nan"),
+        ("promotion_threshold: 0.55", "promotion_threshold: 1"),
+        ("promotion_threshold: 0.55", 'promotion_threshold: "0.55"'),
+        ("promotion_threshold: 0.55", "promotion_threshold: true"),
+    ],
+)
+def test_invalid_arena_configuration_is_rejected(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(original, replacement),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize("opening_moves", [128, 129])
+def test_arena_opening_must_be_below_move_limit(
+    tmp_path: Path,
+    opening_moves: int,
+) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "opening_moves: 4",
+            f"opening_moves: {opening_moves}",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize("promotion_threshold", [0.5000001, 1.0])
+def test_arena_promotion_threshold_accepts_valid_endpoints(
+    tmp_path: Path,
+    promotion_threshold: float,
+) -> None:
+    path = _write_config(tmp_path / "valid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "promotion_threshold: 0.55",
+            f"promotion_threshold: {promotion_threshold}",
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_config(path).arena.promotion_threshold == promotion_threshold
+
+
+def test_arena_integer_boundaries_are_valid(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "valid.yaml")
+    contents = path.read_text(encoding="utf-8")
+    contents = contents.replace("seed: 5401", "seed: 18446744073709551615")
+    contents = contents.replace("games: 4", "games: 2")
+    contents = contents.replace("opening_moves: 4", "opening_moves: 0")
+    contents = contents.replace("max_moves: 128", "max_moves: 2")
+    path.write_text(contents, encoding="utf-8")
+
+    config = load_config(path)
+    assert config.arena.seed == (2**64) - 1
+    assert config.arena.games == 2
+    assert config.arena.opening_moves == 0
+    assert config.arena.max_moves == 2
+
+
+def test_unknown_arena_configuration_is_rejected(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "  promotion_threshold: 0.55",
+            "  promotion_threshold: 0.55\n  unknown: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_arena_configuration_is_required(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    contents = path.read_text(encoding="utf-8")
+    path.write_text(contents[: contents.index("arena:\n")], encoding="utf-8")
 
     with pytest.raises(ValidationError):
         load_config(path)

@@ -274,6 +274,108 @@ def test_load_rejects_config_that_fails_strict_app_validation(
         load_checkpoint(path, network=_network(config), config=config)
 
 
+def test_inference_load_accepts_legacy_config_without_arena(
+    tmp_path: Path,
+    config: AppConfig,
+) -> None:
+    path = tmp_path / "checkpoint.pt"
+    source, _ = _saved_checkpoint(path, config)
+    expected_metadata = config.model_dump(mode="json")
+    del expected_metadata["arena"]
+
+    def mutate(payload: dict[str, object]) -> None:
+        saved_config = cast("dict[str, object]", payload["config"])
+        del saved_config["arena"]
+
+    _rewrite_payload(path, mutate)
+    target = _network(config)
+    torch.manual_seed(31013)
+    expected_rng = torch.get_rng_state().clone()
+
+    metadata = load_checkpoint(path, network=target, config=config)
+
+    assert metadata == CheckpointMetadata(step=7, config=expected_metadata)
+    _assert_model_state(target, source.state_dict())
+    torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0.0, atol=0.0)
+
+
+def test_resume_load_accepts_legacy_config_without_arena(
+    tmp_path: Path,
+    config: AppConfig,
+) -> None:
+    torch.manual_seed(1729)
+    path = tmp_path / "checkpoint.pt"
+    source, source_optimizer = _saved_checkpoint(path, config)
+    expected_metadata = config.model_dump(mode="json")
+    del expected_metadata["arena"]
+    expected_random = torch.rand(8)
+
+    def mutate(payload: dict[str, object]) -> None:
+        saved_config = cast("dict[str, object]", payload["config"])
+        del saved_config["arena"]
+
+    _rewrite_payload(path, mutate)
+    target = _network(config)
+    target_optimizer = _optimizer(target, config)
+    torch.manual_seed(999)
+
+    metadata = load_checkpoint(
+        path,
+        network=target,
+        optimizer=target_optimizer,
+        config=config,
+    )
+
+    assert metadata == CheckpointMetadata(step=7, config=expected_metadata)
+    _assert_model_state(target, source.state_dict())
+    _assert_nested_equal(target_optimizer.state_dict(), source_optimizer.state_dict())
+    torch.testing.assert_close(torch.rand(8), expected_random, rtol=0.0, atol=0.0)
+
+
+def test_load_rejects_present_malformed_arena_config(
+    tmp_path: Path,
+    config: AppConfig,
+) -> None:
+    path = tmp_path / "checkpoint.pt"
+    _saved_checkpoint(path, config)
+
+    def mutate(payload: dict[str, object]) -> None:
+        saved_config = cast("dict[str, object]", payload["config"])
+        arena = cast("dict[str, object]", saved_config["arena"])
+        arena["promotion_threshold"] = "0.55"
+
+    _rewrite_payload(path, mutate)
+
+    with pytest.raises(CheckpointError, match="config is invalid"):
+        load_checkpoint(path, network=_network(config), config=config)
+
+
+@pytest.mark.parametrize("tamper", ["missing", "extra", "invalid"])
+def test_legacy_arena_normalization_does_not_weaken_other_config_validation(
+    tmp_path: Path,
+    config: AppConfig,
+    tamper: str,
+) -> None:
+    path = tmp_path / "checkpoint.pt"
+    _saved_checkpoint(path, config)
+
+    def mutate(payload: dict[str, object]) -> None:
+        saved_config = cast("dict[str, object]", payload["config"])
+        del saved_config["arena"]
+        if tamper == "missing":
+            del saved_config["search"]
+        elif tamper == "extra":
+            saved_config["unexpected"] = {}
+        else:
+            learner = cast("dict[str, object]", saved_config["learner"])
+            learner["learning_rate"] = "0.01"
+
+    _rewrite_payload(path, mutate)
+
+    with pytest.raises(CheckpointError, match="config is invalid"):
+        load_checkpoint(path, network=_network(config), config=config)
+
+
 @pytest.mark.parametrize("tamper", ["config", "compatibility"])
 def test_load_rejects_internally_inconsistent_compatibility_metadata(
     tmp_path: Path,

@@ -44,3 +44,9 @@ learner:
   gradient_clip_norm: 5.0
   checkpoint_interval: 5
   augment: true
+arena:
+  seed: 19401
+  games: 4
+  opening_moves: 16
+  max_moves: 1024
+  promotion_threshold: 0.55

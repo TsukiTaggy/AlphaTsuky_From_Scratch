@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import random
+import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -16,12 +20,13 @@ from pydantic import ValidationError
 from azgo.config import AppConfig, load_config
 
 if TYPE_CHECKING:
+    from azgo.arena import ArenaGameResult
     from azgo.evaluator import Evaluator
     from azgo.network import PolicyValueNetwork
 
 app = typer.Typer(
     name="azgo",
-    help="Correctness-first tools for the AlphaZero Go project.",
+    help="Correctness-first Phase 1-7 tools for the AlphaZero Go project.",
     no_args_is_help=True,
     pretty_exceptions_enable=False,
 )
@@ -34,7 +39,7 @@ ConfigArgument = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-6 YAML configuration.",
+        help="Path to a Phase 1-7 YAML configuration.",
     ),
 ]
 ConfigOption = Annotated[
@@ -47,7 +52,7 @@ ConfigOption = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-6 YAML configuration.",
+        help="Path to a Phase 1-7 YAML configuration.",
     ),
 ]
 MovesOption = Annotated[
@@ -127,6 +132,40 @@ TrainingOverwriteOption = Annotated[
         help="Start fresh and explicitly replace an existing checkpoint.",
     ),
 ]
+ArenaCandidateOption = Annotated[
+    Path,
+    typer.Option(
+        "--candidate",
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Trusted compatible candidate checkpoint to evaluate.",
+    ),
+]
+ArenaIncumbentOption = Annotated[
+    Path,
+    typer.Option(
+        "--incumbent",
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Trusted compatible incumbent checkpoint to evaluate.",
+    ),
+]
+PromotionOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--promote-to",
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Atomically copy an eligible candidate to this explicit destination.",
+    ),
+]
+
+
+class ArenaCommandError(ValueError):
+    """Raised when arena command inputs or promotion safety checks fail."""
 
 
 def _load_or_exit(path: Path) -> AppConfig:
@@ -145,7 +184,7 @@ def _load_or_exit(path: Path) -> AppConfig:
 
 @app.command("validate-config")
 def validate_config_command(config: ConfigArgument) -> None:
-    """Compose and strictly validate a Phase 1-6 configuration."""
+    """Compose and strictly validate a Phase 1-7 configuration."""
 
     settings = _load_or_exit(config)
     typer.echo(json.dumps(settings.model_dump(mode="json"), indent=2, sort_keys=True))
@@ -227,6 +266,29 @@ def train_network(
         )
     except _training_failures() as exc:
         typer.echo(f"Training failed: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+
+
+@app.command("evaluate-arena")
+def evaluate_arena(
+    config: ConfigOption,
+    candidate: ArenaCandidateOption,
+    incumbent: ArenaIncumbentOption,
+    promote_to: PromotionOption = None,
+) -> None:
+    """Evaluate candidate and incumbent checkpoints and optionally promote."""
+
+    settings = _load_or_exit(config)
+    try:
+        report = _run_arena(
+            settings,
+            candidate=candidate,
+            incumbent=incumbent,
+            promote_to=promote_to,
+        )
+    except _arena_failures() as exc:
+        typer.echo(f"Arena evaluation failed: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
 
@@ -313,6 +375,151 @@ def _build_evaluator(
         restore_rng=False,
     )
     return TorchEvaluator(network), "checkpoint", metadata.step
+
+
+def _arena_failures() -> tuple[type[Exception], ...]:
+    """Return arena command failures without loading arena for other commands."""
+
+    from azgo.arena import ArenaError
+    from azgo.checkpoint import CheckpointError
+
+    return (ArenaError, CheckpointError, ArenaCommandError, OSError)
+
+
+def _run_arena(
+    settings: AppConfig,
+    *,
+    candidate: Path,
+    incumbent: Path,
+    promote_to: Path | None,
+) -> dict[str, object]:
+    """Evaluate two immutable checkpoint identities and optionally promote."""
+
+    from azgo.arena import ArenaRunner
+
+    candidate = candidate.expanduser().resolve()
+    incumbent = incumbent.expanduser().resolve()
+    destination = (
+        None if promote_to is None else promote_to.expanduser().resolve()
+    )
+    if candidate == incumbent:
+        raise ArenaCommandError(
+            "candidate and incumbent must resolve to different checkpoint paths"
+        )
+    if destination == candidate:
+        raise ArenaCommandError("--promote-to must not resolve to the candidate path")
+
+    candidate_sha256 = _sha256_file(candidate)
+    incumbent_sha256 = _sha256_file(incumbent)
+    candidate_evaluator, _, candidate_step = _build_evaluator(settings, candidate)
+    incumbent_evaluator, _, incumbent_step = _build_evaluator(settings, incumbent)
+    if _sha256_file(candidate) != candidate_sha256:
+        raise ArenaCommandError("candidate checkpoint changed while it was being loaded")
+    if _sha256_file(incumbent) != incumbent_sha256:
+        raise ArenaCommandError("incumbent checkpoint changed while it was being loaded")
+
+    result = ArenaRunner(
+        candidate_evaluator,
+        incumbent_evaluator,
+        settings,
+    ).run()
+    promotion_requested = destination is not None
+    promoted = False
+    if result.promotion_eligible and destination is not None:
+        _atomic_promote_checkpoint(
+            candidate,
+            destination,
+            expected_sha256=candidate_sha256,
+        )
+        promoted = True
+
+    return {
+        "candidate": str(candidate),
+        "candidate_points": float(result.candidate_points),
+        "candidate_score": float(result.candidate_score),
+        "candidate_sha256": candidate_sha256,
+        "candidate_step": candidate_step,
+        "candidate_wins": int(result.candidate_wins),
+        "draws": int(result.draws),
+        "games": [_arena_game_record(game) for game in result.games],
+        "games_played": len(result.games),
+        "incumbent": str(incumbent),
+        "incumbent_sha256": incumbent_sha256,
+        "incumbent_step": incumbent_step,
+        "incumbent_wins": int(result.incumbent_wins),
+        "promoted": promoted,
+        "promoted_to": str(destination) if promoted else None,
+        "promotion_eligible": bool(result.promotion_eligible),
+        "promotion_requested": promotion_requested,
+        "promotion_threshold": float(result.promotion_threshold),
+    }
+
+
+def _arena_game_record(game: ArenaGameResult) -> dict[str, object]:
+    """Convert one arena game to the stable compact JSON representation."""
+
+    return {
+        "black_score": float(game.final_score.black_score),
+        "candidate_color": game.candidate_color.name.lower(),
+        "candidate_outcome": game.candidate_outcome,
+        "game_index": int(game.game_index),
+        "move_count": int(game.move_count),
+        "opening_actions": [int(action) for action in game.opening_actions],
+        "pair_index": int(game.pair_index),
+        "white_score": float(game.final_score.white_score),
+        "winner": None if game.winner is None else game.winner.name.lower(),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the SHA-256 identity of a regular checkpoint file."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_promote_checkpoint(
+    candidate: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+) -> None:
+    """Atomically byte-copy a candidate after confirming its evaluated identity."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        digest = hashlib.sha256()
+        with (
+            candidate.open("rb") as source,
+            tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary,
+        ):
+            temporary_path = Path(temporary.name)
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+                temporary.write(chunk)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+
+        if digest.hexdigest() != expected_sha256:
+            raise ArenaCommandError(
+                "candidate checkpoint changed after arena evaluation; promotion aborted"
+            )
+        os.replace(temporary_path, destination)  # noqa: PTH105
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink()
 
 
 def _run_search(

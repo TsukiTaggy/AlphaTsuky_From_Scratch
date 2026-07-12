@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 BoardSize = Annotated[int, Field(strict=True)]
 Seed = Annotated[int, Field(strict=True, ge=0, le=(2**64) - 1)]
@@ -30,6 +38,11 @@ MomentumFiniteStrictFloat = Annotated[
     float,
     Field(strict=True, ge=0.0, lt=1.0, allow_inf_nan=False),
 ]
+PromotionThresholdStrictFloat = Annotated[
+    float,
+    Field(strict=True, gt=0.5, le=1.0, allow_inf_nan=False),
+]
+PositiveEvenStrictInt = Annotated[int, Field(strict=True, ge=1, multiple_of=2)]
 SUPPORTED_BOARD_SIZES = frozenset({5, 9, 13, 19})
 
 
@@ -178,8 +191,37 @@ class LearnerConfig(BaseModel):
         return value
 
 
+class ArenaConfig(BaseModel):
+    """Validated settings for deterministic paired checkpoint evaluation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    seed: Seed
+    games: PositiveEvenStrictInt
+    opening_moves: NonNegativeStrictInt
+    max_moves: MoveLimitStrictInt
+    promotion_threshold: PromotionThresholdStrictFloat
+
+    @field_validator("promotion_threshold", mode="before")
+    @classmethod
+    def require_float_promotion_threshold(cls, value: object) -> object:
+        """Reject integers and booleans at the strict YAML configuration boundary."""
+
+        if type(value) is not float:
+            raise ValueError("promotion_threshold must be a floating-point number")
+        return value
+
+    @model_validator(mode="after")
+    def validate_opening_moves(self) -> Self:
+        """Require every configured opening to fit within the game move limit."""
+
+        if self.opening_moves >= self.max_moves:
+            raise ValueError("opening_moves must be less than max_moves")
+        return self
+
+
 class AppConfig(BaseModel):
-    """Complete validated configuration for Phases 1 through 6."""
+    """Complete validated configuration for Phases 1 through 7."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -191,6 +233,7 @@ class AppConfig(BaseModel):
     self_play: SelfPlayConfig
     replay: ReplayConfig
     learner: LearnerConfig
+    arena: ArenaConfig
 
 
 _APP_CONFIG_ADAPTER = TypeAdapter(AppConfig)
@@ -233,6 +276,6 @@ def validate_config(config: DictConfig) -> AppConfig:
 
 
 def load_config(path: str | Path, overrides: tuple[str, ...] = ()) -> AppConfig:
-    """Compose and validate a Phase 1-6 YAML configuration."""
+    """Compose and validate a Phase 1-7 YAML configuration."""
 
     return validate_config(compose_config(path, overrides))
