@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
-from typing import TYPE_CHECKING
+from threading import Lock
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
@@ -12,6 +15,11 @@ from azgo.config import AppConfig
 from azgo.encoding import encode_state
 from azgo.evaluator import Evaluator
 from azgo.game import Color, GameState, Rules, Ruleset, Score
+from azgo.inference import (
+    CountingEvaluator,
+    DeterministicInferenceCoordinator,
+    InferenceMetrics,
+)
 from azgo.search import MCTS, SearchResult
 
 if TYPE_CHECKING:
@@ -28,6 +36,10 @@ class SelfPlayError(ValueError):
 
 class SelfPlayLimitError(SelfPlayError):
     """Raised when a game reaches its safety limit before normal termination."""
+
+
+class ParallelSelfPlayError(SelfPlayError):
+    """Raised when a complete multi-game self-play batch cannot be produced."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +163,55 @@ class SelfPlayGame:
 
 
 @dataclass(frozen=True, slots=True)
+class ParallelSelfPlayResult:
+    """One complete, ordered multi-game self-play run and its inference metrics."""
+
+    games: tuple[SelfPlayGame, ...]
+    effective_workers: int
+    inference_mode: Literal["direct", "deterministic_batch"]
+    inference_metrics: InferenceMetrics
+
+    def __post_init__(self) -> None:
+        try:
+            games = tuple(self.games)
+        except TypeError as exc:
+            raise ParallelSelfPlayError("games must be iterable") from exc
+        if not games:
+            raise ParallelSelfPlayError("games must contain at least one completed game")
+        if any(not isinstance(game, SelfPlayGame) for game in games):
+            raise ParallelSelfPlayError("games must contain only SelfPlayGame objects")
+        game_indices = tuple(game.game_index for game in games)
+        expected_indices = tuple(range(game_indices[0], game_indices[0] + len(games)))
+        if game_indices != expected_indices:
+            raise ParallelSelfPlayError(
+                "games must have contiguous ascending game indices"
+            )
+        effective_workers = _positive_integer(
+            self.effective_workers,
+            "effective_workers",
+            ParallelSelfPlayError,
+        )
+        if effective_workers > len(games):
+            raise ParallelSelfPlayError(
+                "effective_workers must be no greater than the number of games"
+            )
+        if self.inference_mode not in {"direct", "deterministic_batch"}:
+            raise ParallelSelfPlayError(
+                "inference_mode must be 'direct' or 'deterministic_batch'"
+            )
+        expected_mode = "direct" if effective_workers == 1 else "deterministic_batch"
+        if self.inference_mode != expected_mode:
+            raise ParallelSelfPlayError(
+                f"inference_mode must be '{expected_mode}' for {effective_workers} worker(s)"
+            )
+        if not isinstance(self.inference_metrics, InferenceMetrics):
+            raise ParallelSelfPlayError("inference_metrics must be InferenceMetrics")
+
+        object.__setattr__(self, "games", games)
+        object.__setattr__(self, "effective_workers", effective_workers)
+
+
+@dataclass(frozen=True, slots=True)
 class _PendingSample:
     features: NDArray[np.float32]
     policy: NDArray[np.float32]
@@ -252,6 +313,187 @@ class SelfPlayRunner:
         )
 
 
+class ParallelSelfPlayRunner:
+    """Generate a complete deterministic batch directly or with coordinated workers."""
+
+    def __init__(
+        self,
+        evaluator: Evaluator,
+        config: AppConfig,
+        workers: int | None = None,
+    ) -> None:
+        if not isinstance(evaluator, Evaluator):
+            raise TypeError("evaluator must implement Evaluator")
+        if not isinstance(config, AppConfig):
+            raise TypeError("config must be an AppConfig")
+
+        configured_workers = config.self_play.workers if workers is None else workers
+        effective_workers = _positive_integer(
+            configured_workers,
+            "workers",
+            ParallelSelfPlayError,
+        )
+        if effective_workers > config.self_play.games:
+            raise ParallelSelfPlayError(
+                "workers must be no greater than self_play.games "
+                f"({config.self_play.games})"
+            )
+
+        self._evaluator = evaluator
+        self._config = config
+        self._workers = effective_workers
+
+    @property
+    def effective_workers(self) -> int:
+        """Number of game workers used by this runner."""
+
+        return self._workers
+
+    def play_games(self, first_game_index: int = 0) -> ParallelSelfPlayResult:
+        """Play the configured contiguous game range without returning partial work."""
+
+        first_index = _unsigned_64_bit_integer_for_parallel(
+            first_game_index,
+            "first_game_index",
+        )
+        final_index = first_index + self._config.self_play.games - 1
+        if final_index > _MAX_UINT64:
+            raise ParallelSelfPlayError(
+                "the configured game range exceeds the unsigned 64-bit game index limit"
+            )
+
+        if self._workers == 1:
+            return self._play_direct(first_index)
+        return self._play_coordinated(first_index)
+
+    def _play_direct(self, first_game_index: int) -> ParallelSelfPlayResult:
+        counted = CountingEvaluator(self._evaluator)
+        runner = SelfPlayRunner(counted, self._config)
+        try:
+            games = tuple(
+                runner.play_game(game_index)
+                for game_index in _assigned_game_indices(
+                    first_game_index,
+                    self._config.self_play.games,
+                    worker_id=0,
+                    workers=1,
+                )
+            )
+        except BaseException as exc:
+            underlying = _underlying_cause(exc)
+            raise ParallelSelfPlayError(
+                f"self-play batch failed: {underlying}"
+            ) from underlying
+
+        ordered = _validate_complete_game_range(
+            games,
+            first_game_index,
+            self._config.self_play.games,
+        )
+        return ParallelSelfPlayResult(
+            games=ordered,
+            effective_workers=1,
+            inference_mode="direct",
+            inference_metrics=counted.metrics,
+        )
+
+    def _play_coordinated(self, first_game_index: int) -> ParallelSelfPlayResult:
+        worker_ids = tuple(range(self._workers))
+        coordinator = DeterministicInferenceCoordinator(
+            self._evaluator,
+            max_batch_size=self._config.inference.max_batch_size,
+            client_ids=worker_ids,
+        )
+        clients = tuple(coordinator.client(worker_id) for worker_id in worker_ids)
+        assignments = tuple(
+            tuple(
+                _assigned_game_indices(
+                    first_game_index,
+                    self._config.self_play.games,
+                    worker_id=worker_id,
+                    workers=self._workers,
+                )
+            )
+            for worker_id in worker_ids
+        )
+        failure_lock = Lock()
+        primary_failure: list[BaseException] = []
+
+        def record_failure(cause: BaseException) -> BaseException:
+            underlying = _underlying_cause(cause)
+            with failure_lock:
+                if not primary_failure:
+                    primary_failure.append(underlying)
+                primary = primary_failure[0]
+            with suppress(Exception):
+                coordinator.abort(primary)
+            return primary
+
+        def run_worker(worker_id: int) -> tuple[SelfPlayGame, ...]:
+            client = clients[worker_id]
+            caught: BaseException | None = None
+            try:
+                runner = SelfPlayRunner(client, self._config)
+                return tuple(
+                    runner.play_game(game_index) for game_index in assignments[worker_id]
+                )
+            except BaseException as exc:
+                caught = exc
+                record_failure(exc)
+                raise
+            finally:
+                try:
+                    client.close()
+                except BaseException as exc:
+                    if caught is None:
+                        record_failure(exc)
+                        raise
+
+        completed: list[tuple[SelfPlayGame, ...]] = []
+        try:
+            with coordinator, ThreadPoolExecutor(
+                max_workers=self._workers,
+                thread_name_prefix="azgo-self-play",
+            ) as executor:
+                futures: list[Future[tuple[SelfPlayGame, ...]]] = []
+                try:
+                    futures.extend(
+                        executor.submit(run_worker, worker_id)
+                        for worker_id in worker_ids
+                    )
+                except BaseException as exc:
+                    # Abort while the coordinator is still inside its running context.
+                    # Already-submitted workers may be waiting for clients whose tasks
+                    # were never submitted, so executor shutdown must not begin first.
+                    record_failure(exc)
+                for future in futures:
+                    try:
+                        completed.append(future.result())
+                    except BaseException as exc:
+                        record_failure(exc)
+        except BaseException as exc:
+            record_failure(exc)
+
+        if primary_failure:
+            primary = primary_failure[0]
+            raise ParallelSelfPlayError(
+                f"parallel self-play batch failed: {primary}"
+            ) from primary
+
+        games = tuple(game for worker_games in completed for game in worker_games)
+        ordered = _validate_complete_game_range(
+            games,
+            first_game_index,
+            self._config.self_play.games,
+        )
+        return ParallelSelfPlayResult(
+            games=ordered,
+            effective_workers=self._workers,
+            inference_mode="deterministic_batch",
+            inference_metrics=coordinator.metrics,
+        )
+
+
 def _random_streams(config: AppConfig, game_index: int) -> tuple[int, Generator]:
     root = np.random.SeedSequence(
         [config.self_play.seed, config.search.seed, game_index]
@@ -305,7 +547,70 @@ def _unsigned_64_bit_integer(value: int, name: str) -> int:
     return normalized
 
 
+def _unsigned_64_bit_integer_for_parallel(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ParallelSelfPlayError(f"{name} must be a nonnegative integer")
+    if value > _MAX_UINT64:
+        raise ParallelSelfPlayError(f"{name} must be an unsigned 64-bit integer")
+    return value
+
+
+def _positive_integer(
+    value: int,
+    name: str,
+    error_type: type[SelfPlayError],
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise error_type(f"{name} must be a positive integer")
+    return value
+
+
+def _assigned_game_indices(
+    first_game_index: int,
+    games: int,
+    *,
+    worker_id: int,
+    workers: int,
+) -> range:
+    """Return one worker's fixed-stride portion of a contiguous game range."""
+
+    return range(first_game_index + worker_id, first_game_index + games, workers)
+
+
+def _validate_complete_game_range(
+    games: tuple[SelfPlayGame, ...],
+    first_game_index: int,
+    game_count: int,
+) -> tuple[SelfPlayGame, ...]:
+    if any(not isinstance(game, SelfPlayGame) for game in games):
+        raise ParallelSelfPlayError(
+            "self-play workers must return only completed SelfPlayGame objects"
+        )
+    ordered = tuple(sorted(games, key=lambda game: game.game_index))
+    actual_indices = tuple(game.game_index for game in ordered)
+    expected_indices = tuple(range(first_game_index, first_game_index + game_count))
+    if actual_indices != expected_indices:
+        raise ParallelSelfPlayError(
+            "self-play workers did not return the exact requested contiguous game range"
+        )
+    return ordered
+
+
+def _underlying_cause(cause: BaseException) -> BaseException:
+    """Return the deepest explicit exception cause without following cycles."""
+
+    current = cause
+    seen: set[int] = set()
+    while current.__cause__ is not None and id(current) not in seen:
+        seen.add(id(current))
+        current = current.__cause__
+    return current
+
+
 __all__ = [
+    "ParallelSelfPlayError",
+    "ParallelSelfPlayResult",
+    "ParallelSelfPlayRunner",
     "SelfPlayError",
     "SelfPlayGame",
     "SelfPlayLimitError",

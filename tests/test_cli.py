@@ -45,6 +45,8 @@ model:
   channels: 64
   residual_blocks: 4
   value_hidden_size: 64
+inference:
+  max_batch_size: 16
 search:
   simulations: 8
   c_puct: 1.5
@@ -54,6 +56,7 @@ search:
 self_play:
   seed: 4343
   games: 1
+  workers: 1
   max_moves: 256
   temperature: 1.0
   temperature_moves: 10
@@ -77,6 +80,8 @@ arena:
   opening_moves: 4
   max_moves: 256
   promotion_threshold: 0.55
+training_run:
+  cycles: 1
 """,
         encoding="utf-8",
     )
@@ -96,10 +101,77 @@ def test_validate_config_command(tmp_path: Path) -> None:
     assert '"dirichlet_fraction": 0.25' in result.output
     assert '"max_moves": 256' in result.output
     assert '"root_noise": true' in result.output
+    assert '"workers": 1' in result.output
+    assert '"max_batch_size": 16' in result.output
     assert '"capacity": 10000' in result.output
     assert '"batch_size": 2' in result.output
     assert '"checkpoint_interval": 1' in result.output
+    assert '"cycles": 1' in result.output
     assert "Configuration is valid" in result.output
+
+
+def test_run_training_cycle_forwards_modes_and_reports_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo import training_run as training_run_module
+
+    config = _config(tmp_path / "test.yaml")
+    run_directory = tmp_path / "managed"
+    calls: list[dict[str, object]] = []
+
+    class FakeResult:
+        def report(self) -> dict[str, object]:
+            return {
+                "completed_cycles": 1,
+                "run_directory": str(run_directory.resolve()),
+            }
+
+    class FakeRunner:
+        def __init__(
+            self,
+            settings: object,
+            directory: Path,
+            *,
+            workers: int | None,
+        ) -> None:
+            calls.append(
+                {
+                    "directory": directory,
+                    "settings": settings,
+                    "workers": workers,
+                }
+            )
+
+        def run(self, *, resume: bool) -> FakeResult:
+            calls[-1]["resume"] = resume
+            return FakeResult()
+
+    monkeypatch.setattr(training_run_module, "TrainingRunRunner", FakeRunner)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "run-training-cycle",
+            "-c",
+            str(config),
+            "--run-dir",
+            str(run_directory),
+            "--resume",
+            "--workers",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "completed_cycles": 1,
+        "run_directory": str(run_directory.resolve()),
+    }
+    assert len(calls) == 1
+    assert calls[0]["directory"] == run_directory.resolve()
+    assert calls[0]["workers"] == 1
+    assert calls[0]["resume"] is True
 
 
 @pytest.mark.parametrize(
@@ -305,8 +377,8 @@ def test_generate_self_play_creates_snapshot_and_reports_batch(
     config = _config(tmp_path / "test.yaml")
     config.write_text(
         config.read_text(encoding="utf-8").replace(
-            "  games: 1\n  max_moves: 256",
-            "  games: 3\n  max_moves: 256",
+            "  games: 1\n  workers: 1\n  max_moves: 256",
+            "  games: 3\n  workers: 1\n  max_moves: 256",
         ),
         encoding="utf-8",
     )
@@ -328,16 +400,88 @@ def test_generate_self_play_creates_snapshot_and_reports_batch(
         "draws": 1,
         "evaluator": "uniform",
         "games_generated": 3,
+        "inference_batches": 0,
+        "inference_max_batch_size": 0,
+        "inference_mean_batch_size": 0.0,
+        "inference_mode": "direct",
+        "inference_positions": 0,
+        "inference_requests": 0,
         "next_game_index": 3,
         "output": str(output.resolve()),
         "positions_generated": 6,
         "replay_capacity": 10000,
         "replay_size": 6,
+        "self_play_workers": 1,
         "white_wins": 1,
     }
     loaded = ReplayBuffer.load(output)
     assert len(loaded) == 6
     assert loaded.next_game_index == 3
+
+
+def test_generate_self_play_worker_override_uses_parallel_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  games: 1\n  workers: 1\n  max_moves: 256",
+            "  games: 3\n  workers: 1\n  max_moves: 256",
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "parallel.npz"
+    calls = _install_fake_self_play_runner(monkeypatch)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "generate-self-play",
+            "-c",
+            str(config),
+            "-o",
+            str(output),
+            "--workers",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sorted(calls) == [0, 1, 2]
+    report = json.loads(result.output)
+    assert report["self_play_workers"] == 2
+    assert report["inference_mode"] == "deterministic_batch"
+    assert report["inference_requests"] == 0
+    assert report["inference_positions"] == 0
+    assert report["inference_batches"] == 0
+    assert report["inference_mean_batch_size"] == 0.0
+    assert report["inference_max_batch_size"] == 0
+
+
+def test_generate_self_play_rejects_worker_override_above_game_count(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path / "test.yaml")
+    output = tmp_path / "replay.npz"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "generate-self-play",
+            "-c",
+            str(config),
+            "-o",
+            str(output),
+            "--workers",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Self-play failed:" in result.output
+    assert "workers must be no greater than self_play.games" in result.output
+    assert not output.exists()
 
 
 def test_generate_self_play_appends_and_overwrite_restarts_sequence(

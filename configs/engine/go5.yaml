@@ -27,10 +27,13 @@ search:
 self_play:
   seed: 5201
   games: 1
+  workers: 1
   max_moves: 256
   temperature: 1.0
   temperature_moves: 10
   root_noise: true
+inference:
+  max_batch_size: 16
 replay:
   capacity: 10000
 learner:
@@ -50,4 +53,6 @@ arena:
   opening_moves: 4
   max_moves: 256
   promotion_threshold: 0.55
+training_run:
+  cycles: 1
 

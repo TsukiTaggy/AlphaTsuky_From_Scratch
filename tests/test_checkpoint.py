@@ -153,6 +153,22 @@ def _modified_config(config: AppConfig, section: str, **changes: object) -> AppC
     return AppConfig.model_validate(raw)
 
 
+def _remove_phase9_config(
+    saved_config: dict[str, object],
+    legacy_phase: int,
+) -> dict[str, object]:
+    """Mutate a saved config into an authentic Phase 6, 7, or 8 shape."""
+
+    del saved_config["training_run"]
+    if legacy_phase <= 7:
+        del saved_config["inference"]
+        self_play = cast("dict[str, object]", saved_config["self_play"])
+        del self_play["workers"]
+    if legacy_phase == 6:
+        del saved_config["arena"]
+    return saved_config
+
+
 def test_round_trip_restores_model_optimizer_step_bn_and_rng(
     tmp_path: Path,
     config: AppConfig,
@@ -249,6 +265,11 @@ def test_payload_has_exact_versioned_contract(tmp_path: Path, config: AppConfig)
     assert payload["format_version"] == 1
     assert payload["step"] == 7
     assert payload["config"] == config.model_dump(mode="json")
+    saved_config = cast("dict[str, object]", payload["config"])
+    saved_self_play = cast("dict[str, object]", saved_config["self_play"])
+    assert saved_self_play["workers"] == config.self_play.workers
+    assert saved_config["inference"] == config.inference.model_dump(mode="json")
+    assert saved_config["training_run"] == config.training_run.model_dump(mode="json")
     assert payload["compatibility"] == {
         "game": {"board_size": config.game.board_size},
         "model": config.model.model_dump(mode="json"),
@@ -274,18 +295,22 @@ def test_load_rejects_config_that_fails_strict_app_validation(
         load_checkpoint(path, network=_network(config), config=config)
 
 
-def test_inference_load_accepts_legacy_config_without_arena(
+@pytest.mark.parametrize("legacy_phase", [6, 7, 8])
+def test_inference_load_accepts_legacy_phase_config(
     tmp_path: Path,
     config: AppConfig,
+    legacy_phase: int,
 ) -> None:
     path = tmp_path / "checkpoint.pt"
     source, _ = _saved_checkpoint(path, config)
-    expected_metadata = config.model_dump(mode="json")
-    del expected_metadata["arena"]
+    expected_metadata = _remove_phase9_config(
+        config.model_dump(mode="json"),
+        legacy_phase,
+    )
 
     def mutate(payload: dict[str, object]) -> None:
         saved_config = cast("dict[str, object]", payload["config"])
-        del saved_config["arena"]
+        _remove_phase9_config(saved_config, legacy_phase)
 
     _rewrite_payload(path, mutate)
     target = _network(config)
@@ -299,20 +324,24 @@ def test_inference_load_accepts_legacy_config_without_arena(
     torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0.0, atol=0.0)
 
 
-def test_resume_load_accepts_legacy_config_without_arena(
+@pytest.mark.parametrize("legacy_phase", [6, 7, 8])
+def test_resume_load_accepts_legacy_phase_config(
     tmp_path: Path,
     config: AppConfig,
+    legacy_phase: int,
 ) -> None:
     torch.manual_seed(1729)
     path = tmp_path / "checkpoint.pt"
     source, source_optimizer = _saved_checkpoint(path, config)
-    expected_metadata = config.model_dump(mode="json")
-    del expected_metadata["arena"]
+    expected_metadata = _remove_phase9_config(
+        config.model_dump(mode="json"),
+        legacy_phase,
+    )
     expected_random = torch.rand(8)
 
     def mutate(payload: dict[str, object]) -> None:
         saved_config = cast("dict[str, object]", payload["config"])
-        del saved_config["arena"]
+        _remove_phase9_config(saved_config, legacy_phase)
 
     _rewrite_payload(path, mutate)
     target = _network(config)
@@ -332,17 +361,50 @@ def test_resume_load_accepts_legacy_config_without_arena(
     torch.testing.assert_close(torch.rand(8), expected_random, rtol=0.0, atol=0.0)
 
 
-def test_load_rejects_present_malformed_arena_config(
+def test_legacy_workers_are_bounded_by_saved_games_during_validation(
     tmp_path: Path,
     config: AppConfig,
+) -> None:
+    path = tmp_path / "checkpoint.pt"
+    source, _ = _saved_checkpoint(path, config)
+    expected_metadata = _remove_phase9_config(config.model_dump(mode="json"), 6)
+
+    def mutate(payload: dict[str, object]) -> None:
+        saved_config = cast("dict[str, object]", payload["config"])
+        _remove_phase9_config(saved_config, 6)
+
+    _rewrite_payload(path, mutate)
+    current = _modified_config(config, "self_play", games=4, workers=4)
+    target = _network(current)
+
+    metadata = load_checkpoint(path, network=target, config=current)
+
+    assert metadata == CheckpointMetadata(step=7, config=expected_metadata)
+    _assert_model_state(target, source.state_dict())
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("arena", "promotion_threshold", "0.55"),
+        ("inference", "max_batch_size", "16"),
+        ("self_play", "workers", "1"),
+    ],
+)
+def test_load_rejects_present_malformed_phase_config(
+    tmp_path: Path,
+    config: AppConfig,
+    section: str,
+    field: str,
+    value: object,
 ) -> None:
     path = tmp_path / "checkpoint.pt"
     _saved_checkpoint(path, config)
 
     def mutate(payload: dict[str, object]) -> None:
         saved_config = cast("dict[str, object]", payload["config"])
-        arena = cast("dict[str, object]", saved_config["arena"])
-        arena["promotion_threshold"] = "0.55"
+        selected = cast("dict[str, object]", saved_config[section])
+        selected[field] = value
 
     _rewrite_payload(path, mutate)
 
@@ -350,10 +412,12 @@ def test_load_rejects_present_malformed_arena_config(
         load_checkpoint(path, network=_network(config), config=config)
 
 
+@pytest.mark.parametrize("legacy_phase", [6, 7, 8])
 @pytest.mark.parametrize("tamper", ["missing", "extra", "invalid"])
-def test_legacy_arena_normalization_does_not_weaken_other_config_validation(
+def test_legacy_phase_normalization_does_not_weaken_other_config_validation(
     tmp_path: Path,
     config: AppConfig,
+    legacy_phase: int,
     tamper: str,
 ) -> None:
     path = tmp_path / "checkpoint.pt"
@@ -361,7 +425,7 @@ def test_legacy_arena_normalization_does_not_weaken_other_config_validation(
 
     def mutate(payload: dict[str, object]) -> None:
         saved_config = cast("dict[str, object]", payload["config"])
-        del saved_config["arena"]
+        _remove_phase9_config(saved_config, legacy_phase)
         if tamper == "missing":
             del saved_config["search"]
         elif tamper == "extra":
@@ -415,13 +479,23 @@ def test_load_rejects_self_consistent_saved_metadata_incompatible_with_current_c
         load_checkpoint(path, network=_network(config), config=config)
 
 
+@pytest.mark.parametrize(
+    ("section", "changes"),
+    [
+        ("search", {"simulations": 17}),
+        ("self_play", {"games": 2, "workers": 2}),
+        ("inference", {"max_batch_size": 7}),
+    ],
+)
 def test_noncompatibility_config_changes_are_allowed(
     tmp_path: Path,
     config: AppConfig,
+    section: str,
+    changes: dict[str, object],
 ) -> None:
     path = tmp_path / "checkpoint.pt"
     source, _ = _saved_checkpoint(path, config)
-    changed = _modified_config(config, "search", simulations=17)
+    changed = _modified_config(config, section, **changes)
     target = _network(changed)
 
     metadata = load_checkpoint(path, network=target, config=changed)

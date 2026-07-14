@@ -1,18 +1,18 @@
 # alphazero-go
 
 `alphazero-go` is a correctness-first, research-oriented implementation of an
-AlphaZero-style Go system. The current Phase 1-7 milestone contains the Python
+AlphaZero-style Go system. The current Phase 1-9 milestone contains the Python
 project foundation, validated configuration, a PyTorch-independent Go rules
 engine, deterministic state encoding and board symmetries, and a CPU-first
 policy-value network with deterministic PUCT search, self-play generation,
-bounded replay storage, CPU training, resumable checkpoints, and paired arena
-evaluation with explicit checkpoint promotion. It is usable on 5x5, 9x9,
-13x13, and 19x19 boards.
+bounded replay storage, CPU training, resumable checkpoints, paired arena
+evaluation, deterministic concurrent inference for parallel self-play, and
+crash-safe orchestration of complete AlphaZero training runs. It is usable on
+5x5, 9x9, 13x13, and 19x19 boards.
 
 The longer-term project is intended to learn only from self-play and the rules
-of Go. Concurrent inference queues and distributed execution are not part of
-this milestone and are not represented by placeholder modules or
-configuration.
+of Go. Distributed execution is not part of this milestone and is not
+represented by placeholder modules or configuration.
 
 ## Requirements
 
@@ -80,6 +80,20 @@ an existing snapshot. It uses `UniformEvaluator` as a correctness smoke path;
 pass `--checkpoint checkpoints/go5.pt` to generate games with a compatible
 trained model.
 
+Checked-in profiles retain one game and one worker. After copying a profile to
+`configs/engine/go5-parallel.yaml` and setting `self_play.games` above one, it
+can opt into parallel generation through `self_play.workers` or override it for
+one command:
+
+```console
+uv run azgo generate-self-play -c configs/engine/go5-parallel.yaml --output data/go5.npz --checkpoint checkpoints/go5.pt --workers 4
+```
+
+Parallel games share one serialized model worker. Requests form deterministic
+barriers ordered by worker ID rather than timing windows, so replay ordering and
+batch formation remain reproducible. The JSON report includes request, position,
+model-batch, mean-batch-size, and maximum-batch-size metrics.
+
 Train the configured CPU network from a replay snapshot and create a checkpoint:
 
 ```console
@@ -116,6 +130,32 @@ uv run azgo evaluate-arena -c configs/engine/go5.yaml --candidate checkpoints/ca
 If evaluation fails or the candidate misses the threshold, the destination is
 left unchanged.
 
+Run the complete configured self-play, learning, and arena cycle from a
+deterministically seeded step-zero network:
+
+```console
+uv run azgo run-training-cycle -c configs/engine/go5.yaml --run-dir runs/go5
+```
+
+The managed run executes `training_run.cycles` cycles. It keeps immutable
+bootstrap and candidate checkpoints, alternates between two replay snapshots,
+and commits a versioned manifest after self-play, training, and arena stages.
+Only an arena-eligible candidate becomes the next incumbent; a rejected
+candidate is retained as evidence but never becomes the parent of later
+training.
+
+After interruption, resume with the same configuration. Omitting `--workers`
+reuses the worker count recorded during initialization:
+
+```console
+uv run azgo run-training-cycle -c configs/engine/go5.yaml --run-dir runs/go5 --resume
+```
+
+Resume validates configuration, paths, hashes, checkpoint compatibility, and
+replay metadata before doing work. A completed run resumes as a validated
+no-op. Fresh mode refuses an existing directory, and concurrent writers are
+rejected through an operating-system lock.
+
 Equivalent validated configurations are provided at:
 
 - `configs/engine/go5.yaml`
@@ -132,7 +172,7 @@ Pydantic models before an engine is constructed. Unknown fields and invalid
 values are rejected.
 
 The current YAML contract contains only settings owned by implemented Phase
-1-7 subsystems:
+1-9 subsystems:
 
 - `game.board_size`: one of `5`, `9`, `13`, or `19`
 - `game.komi`: a finite number added to White's score
@@ -159,6 +199,8 @@ The current YAML contract contains only settings owned by implemented Phase
 - `self_play.temperature`: a finite positive visit-sampling temperature
 - `self_play.temperature_moves`: a nonnegative number of early sampled moves
 - `self_play.root_noise`: a strict boolean controlling root noise at each move
+- `self_play.workers`: a positive worker count no greater than `self_play.games`
+- `inference.max_batch_size`: a positive deterministic model-batch position cap
 - `replay.capacity`: a positive FIFO capacity counted in positions
 - `learner.seed`: an unsigned 64-bit seed for initialization and replay sampling
 - `learner.batch_size`: a positive number of positions per optimizer update
@@ -175,6 +217,11 @@ The current YAML contract contains only settings owned by implemented Phase
 - `arena.opening_moves`: a nonnegative number of seeded non-pass opening moves
 - `arena.max_moves`: a safety bound greater than the opening length
 - `arena.promotion_threshold`: a strict finite candidate score in `(0.5, 1]`
+- `training_run.cycles`: the immutable positive total cycle target for a managed run
+
+Replay capacity must be at least `learner.batch_size`. During a managed run,
+every cycle generates at least one configured self-play batch; the first cycle
+continues generating batches until a learner batch is available.
 
 The fixed rule fields are deliberately explicit in YAML. Changing one to an
 unsupported alternative fails validation instead of silently selecting
@@ -252,7 +299,8 @@ Search nodes retain complete immutable `GameState` histories because identical
 stone arrangements can have different positional-superko histories. The tree
 therefore does not merge transpositions. Call `advance(action)` to retain an
 explored child subtree after a move, or `reset(state)` to start from a new root.
-Concurrent inference queues and time-limited search remain later-phase work.
+Search itself remains synchronous and time-independent; parallel self-play
+coordinates multiple independent searches through the inference boundary.
 
 ## Self-play and replay
 
@@ -266,6 +314,27 @@ root visit policy, the selected action and metadata, and a terminal value from
 the player-to-move perspective of that feature tensor. Reaching `max_moves`
 raises `SelfPlayLimitError`; partial games are never labeled with invented
 outcomes.
+
+`ParallelSelfPlayRunner` assigns contiguous game indices to fixed worker IDs by
+stride. One worker uses the original direct execution path; multiple workers
+share deterministic inference clients and return games sorted by game index.
+Any client, game, or evaluator failure aborts the complete batch before replay
+storage changes.
+
+## Concurrent inference
+
+`azgo.inference.DeterministicInferenceCoordinator` owns a single model worker
+and synchronous evaluator client per active self-play worker. It waits for one
+request from every active client, orders requests by client ID, and splits the
+flattened positions into fixed chunks no larger than `inference.max_batch_size`.
+Completed clients leave later barriers. There is no latency window, so operating
+system thread timing cannot change batch composition.
+
+The coordinator validates every request and model result before returning
+detached slices to clients. Evaluation or lifecycle failure aborts the service,
+releases every waiter, and prevents partial game results. Immutable aggregate
+metrics expose requests, positions, model batches, mean batch size, and maximum
+observed batch size.
 
 `azgo.replay.ReplayBuffer` is a fixed-board, position-capacity FIFO buffer.
 Canonical samples are stored once, while seeded sampling can apply a random D4
@@ -298,6 +367,10 @@ uses PyTorch's restricted `weights_only=True` mode and validates exact fields,
 configuration compatibility, tensor shapes, scalar metadata, and finite
 numerical state before mutation. Still load checkpoint files only from sources
 you trust.
+Format-version-1 Phase 6 through Phase 8 checkpoints remain loadable when they
+lack newer operational arena, inference, worker, or training-run fields; those
+values are supplied only while validating metadata and never change model
+compatibility.
 
 ## Arena evaluation and promotion
 
@@ -315,12 +388,40 @@ candidate while copying, so a checkpoint changed during evaluation cannot be
 promoted. Explicit promotion uses same-directory temporary storage, syncing,
 and atomic replacement.
 
+## Managed training runs
+
+`azgo.training_run.TrainingRunRunner` composes the typed operations in
+`azgo.operations` without importing the CLI. Initialization builds a seeded
+step-zero network and manifest in a sibling staging directory, then atomically
+renames it into place. Artifact paths stored in the manifest are relative, so a
+complete run directory can be relocated.
+
+Each stage writes its output atomically before the manifest advances. Self-play
+reads the manifest-selected replay and writes the inactive replay slot;
+training writes a cycle-specific candidate from the current accepted incumbent;
+arena commits either that candidate or the unchanged incumbent. If the process
+stops after an output write but before its manifest commit, resume regenerates
+only that uncommitted stage from immutable inputs. A committed artifact that is
+missing, corrupt, incompatible, or outside the run directory fails closed.
+
+The stable run layout is:
+
+```text
+run/
+  manifest.json
+  bootstrap.pt
+  replays/replay-0.npz
+  replays/replay-1.npz       # appears after the next cycle
+  cycles/000001/candidate.pt
+  cycles/000002/candidate.pt
+```
+
 See [Go rules](docs/game_rules.md) for the normative rule contract and
 [Architecture](docs/architecture.md) for package boundaries and data flow.
 
 ## Development and verification
 
-Run every Phase 1-7 quality gate from the repository root:
+Run every Phase 1-9 quality gate from the repository root:
 
 ```console
 uv run ruff check .
@@ -345,6 +446,13 @@ saving, and uniform versus checkpoint-backed CLI evaluation.
 Phase 7 coverage adds deterministic paired openings, color balance, arena
 scoring and threshold decisions, compact reports, checkpoint identity checks,
 and atomic explicit promotion with failure-safe destination preservation.
+Phase 8 coverage adds deterministic barrier ordering, fixed batch chunking,
+client lifecycle and abort propagation, parallel-game equivalence, stable
+replay ordering, inference metrics, and legacy checkpoint metadata migration.
+Phase 9 coverage adds deterministic bootstrap, accepted and rejected candidate
+lineage, alternating replay artifacts, strict manifests and path containment,
+exclusive writer locking, stage-level failure recovery, corruption detection,
+configuration and worker resume checks, and completed-run no-op validation.
 
 The engine benchmark is intended for reproducible regression measurements.
 Profile evidence should precede internal optimization, and optimizations must

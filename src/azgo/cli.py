@@ -1,14 +1,10 @@
-"""Command-line tools for configuration and the Go rules engine."""
+"""Thin command-line adapters for the implemented AlphaZero Go workflows."""
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import random
-import tempfile
 import time
-from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -20,13 +16,12 @@ from pydantic import ValidationError
 from azgo.config import AppConfig, load_config
 
 if TYPE_CHECKING:
-    from azgo.arena import ArenaGameResult
     from azgo.evaluator import Evaluator
     from azgo.network import PolicyValueNetwork
 
 app = typer.Typer(
     name="azgo",
-    help="Correctness-first Phase 1-7 tools for the AlphaZero Go project.",
+    help="Correctness-first Phase 1-9 tools for the AlphaZero Go project.",
     no_args_is_help=True,
     pretty_exceptions_enable=False,
 )
@@ -39,7 +34,7 @@ ConfigArgument = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-7 YAML configuration.",
+        help="Path to a Phase 1-9 YAML configuration.",
     ),
 ]
 ConfigOption = Annotated[
@@ -52,7 +47,7 @@ ConfigOption = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-7 YAML configuration.",
+        help="Path to a Phase 1-9 YAML configuration.",
     ),
 ]
 MovesOption = Annotated[
@@ -88,6 +83,24 @@ OverwriteOption = Annotated[
         help="Replace an existing replay snapshot instead of appending to it.",
     ),
 ]
+WorkersOption = Annotated[
+    int | None,
+    typer.Option(
+        "--workers",
+        min=1,
+        help="Override the validated self-play worker count for this command.",
+    ),
+]
+RunDirectoryOption = Annotated[
+    Path,
+    typer.Option(
+        "--run-dir",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        help="Managed training-run directory to create or resume.",
+    ),
+]
 CheckpointOption = Annotated[
     Path | None,
     typer.Option(
@@ -95,7 +108,7 @@ CheckpointOption = Annotated[
         file_okay=True,
         dir_okay=False,
         resolve_path=True,
-        help="Optional trusted Phase 6 model checkpoint used for evaluation.",
+        help="Optional trusted compatible model checkpoint used for evaluation.",
     ),
 ]
 ReplayInputOption = Annotated[
@@ -115,7 +128,7 @@ TrainingCheckpointOption = Annotated[
         file_okay=True,
         dir_okay=False,
         resolve_path=True,
-        help="Trusted Phase 6 checkpoint to create, replace, or resume.",
+        help="Trusted compatible checkpoint to create, replace, or resume.",
     ),
 ]
 ResumeOption = Annotated[
@@ -123,6 +136,13 @@ ResumeOption = Annotated[
     typer.Option(
         "--resume/--no-resume",
         help="Resume optimizer, step, and random state from an existing checkpoint.",
+    ),
+]
+RunResumeOption = Annotated[
+    bool,
+    typer.Option(
+        "--resume/--no-resume",
+        help="Resume the validated manifest or create a new managed run.",
     ),
 ]
 TrainingOverwriteOption = Annotated[
@@ -184,7 +204,7 @@ def _load_or_exit(path: Path) -> AppConfig:
 
 @app.command("validate-config")
 def validate_config_command(config: ConfigArgument) -> None:
-    """Compose and strictly validate a Phase 1-7 configuration."""
+    """Compose and strictly validate a Phase 1-9 configuration."""
 
     settings = _load_or_exit(config)
     typer.echo(json.dumps(settings.model_dump(mode="json"), indent=2, sort_keys=True))
@@ -228,6 +248,7 @@ def generate_self_play(
     output: OutputOption,
     overwrite: OverwriteOption = False,
     checkpoint: CheckpointOption = None,
+    workers: WorkersOption = None,
 ) -> None:
     """Generate deterministic games into a replay snapshot."""
 
@@ -238,6 +259,7 @@ def generate_self_play(
             output,
             overwrite=overwrite,
             checkpoint=checkpoint,
+            workers=workers,
         )
     except _self_play_failures() as exc:
         typer.echo(f"Self-play failed: {exc}", err=True)
@@ -293,6 +315,38 @@ def evaluate_arena(
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
 
 
+@app.command("run-training-cycle")
+def run_training_cycle(
+    config: ConfigOption,
+    run_directory: RunDirectoryOption,
+    resume: RunResumeOption = False,
+    workers: WorkersOption = None,
+) -> None:
+    """Create or resume a deterministic managed AlphaZero training run."""
+
+    settings = _load_or_exit(config)
+    try:
+        from azgo.training_run import TrainingRunRunner
+
+        report = TrainingRunRunner(
+            settings,
+            run_directory,
+            workers=workers,
+        ).run(resume=resume)
+    except _training_run_failures() as exc:
+        typer.echo(f"Training run failed: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(report.report(), indent=2, sort_keys=True))
+
+
+def _training_run_failures() -> tuple[type[Exception], ...]:
+    """Return managed-run failures without importing its dependencies at startup."""
+
+    from azgo.training_run import TrainingRunError
+
+    return (TrainingRunError, OSError, ValueError)
+
+
 def _run_engine_benchmark(settings: AppConfig) -> dict[str, float | int]:
     """Run the benchmark with a command-local game-engine import."""
 
@@ -343,15 +397,9 @@ def _search_failures() -> tuple[type[Exception], ...]:
 def _build_network(settings: AppConfig) -> PolicyValueNetwork:
     """Construct the configured policy-value architecture on CPU."""
 
-    from azgo.network import PolicyValueNetwork
+    from azgo.operations import build_network
 
-    return PolicyValueNetwork(
-        board_size=settings.game.board_size,
-        history_length=settings.model.history_length,
-        channels=settings.model.channels,
-        residual_blocks=settings.model.residual_blocks,
-        value_hidden_size=settings.model.value_hidden_size,
-    )
+    return build_network(settings)
 
 
 def _build_evaluator(
@@ -360,21 +408,9 @@ def _build_evaluator(
 ) -> tuple[Evaluator, str, int | None]:
     """Build a uniform evaluator or load a trusted compatible checkpoint."""
 
-    from azgo.checkpoint import load_checkpoint
-    from azgo.evaluator import TorchEvaluator, UniformEvaluator
+    from azgo.operations import build_evaluator
 
-    if checkpoint is None:
-        return UniformEvaluator(), "uniform", None
-
-    network = _build_network(settings)
-    metadata = load_checkpoint(
-        checkpoint.expanduser().resolve(),
-        network=network,
-        config=settings,
-        optimizer=None,
-        restore_rng=False,
-    )
-    return TorchEvaluator(network), "checkpoint", metadata.step
+    return build_evaluator(settings, checkpoint, network_factory=_build_network)
 
 
 def _arena_failures() -> tuple[type[Exception], ...]:
@@ -382,8 +418,9 @@ def _arena_failures() -> tuple[type[Exception], ...]:
 
     from azgo.arena import ArenaError
     from azgo.checkpoint import CheckpointError
+    from azgo.operations import OperationError
 
-    return (ArenaError, CheckpointError, ArenaCommandError, OSError)
+    return (ArenaError, CheckpointError, OperationError, ArenaCommandError, OSError)
 
 
 def _run_arena(
@@ -395,131 +432,15 @@ def _run_arena(
 ) -> dict[str, object]:
     """Evaluate two immutable checkpoint identities and optionally promote."""
 
-    from azgo.arena import ArenaRunner
+    from azgo.operations import evaluate_checkpoints
 
-    candidate = candidate.expanduser().resolve()
-    incumbent = incumbent.expanduser().resolve()
-    destination = (
-        None if promote_to is None else promote_to.expanduser().resolve()
-    )
-    if candidate == incumbent:
-        raise ArenaCommandError(
-            "candidate and incumbent must resolve to different checkpoint paths"
-        )
-    if destination == candidate:
-        raise ArenaCommandError("--promote-to must not resolve to the candidate path")
-
-    candidate_sha256 = _sha256_file(candidate)
-    incumbent_sha256 = _sha256_file(incumbent)
-    candidate_evaluator, _, candidate_step = _build_evaluator(settings, candidate)
-    incumbent_evaluator, _, incumbent_step = _build_evaluator(settings, incumbent)
-    if _sha256_file(candidate) != candidate_sha256:
-        raise ArenaCommandError("candidate checkpoint changed while it was being loaded")
-    if _sha256_file(incumbent) != incumbent_sha256:
-        raise ArenaCommandError("incumbent checkpoint changed while it was being loaded")
-
-    result = ArenaRunner(
-        candidate_evaluator,
-        incumbent_evaluator,
+    return evaluate_checkpoints(
         settings,
-    ).run()
-    promotion_requested = destination is not None
-    promoted = False
-    if result.promotion_eligible and destination is not None:
-        _atomic_promote_checkpoint(
-            candidate,
-            destination,
-            expected_sha256=candidate_sha256,
-        )
-        promoted = True
-
-    return {
-        "candidate": str(candidate),
-        "candidate_points": float(result.candidate_points),
-        "candidate_score": float(result.candidate_score),
-        "candidate_sha256": candidate_sha256,
-        "candidate_step": candidate_step,
-        "candidate_wins": int(result.candidate_wins),
-        "draws": int(result.draws),
-        "games": [_arena_game_record(game) for game in result.games],
-        "games_played": len(result.games),
-        "incumbent": str(incumbent),
-        "incumbent_sha256": incumbent_sha256,
-        "incumbent_step": incumbent_step,
-        "incumbent_wins": int(result.incumbent_wins),
-        "promoted": promoted,
-        "promoted_to": str(destination) if promoted else None,
-        "promotion_eligible": bool(result.promotion_eligible),
-        "promotion_requested": promotion_requested,
-        "promotion_threshold": float(result.promotion_threshold),
-    }
-
-
-def _arena_game_record(game: ArenaGameResult) -> dict[str, object]:
-    """Convert one arena game to the stable compact JSON representation."""
-
-    return {
-        "black_score": float(game.final_score.black_score),
-        "candidate_color": game.candidate_color.name.lower(),
-        "candidate_outcome": game.candidate_outcome,
-        "game_index": int(game.game_index),
-        "move_count": int(game.move_count),
-        "opening_actions": [int(action) for action in game.opening_actions],
-        "pair_index": int(game.pair_index),
-        "white_score": float(game.final_score.white_score),
-        "winner": None if game.winner is None else game.winner.name.lower(),
-    }
-
-
-def _sha256_file(path: Path) -> str:
-    """Return the SHA-256 identity of a regular checkpoint file."""
-
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _atomic_promote_checkpoint(
-    candidate: Path,
-    destination: Path,
-    *,
-    expected_sha256: str,
-) -> None:
-    """Atomically byte-copy a candidate after confirming its evaluated identity."""
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        digest = hashlib.sha256()
-        with (
-            candidate.open("rb") as source,
-            tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=destination.parent,
-                prefix=f".{destination.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary,
-        ):
-            temporary_path = Path(temporary.name)
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-                temporary.write(chunk)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-
-        if digest.hexdigest() != expected_sha256:
-            raise ArenaCommandError(
-                "candidate checkpoint changed after arena evaluation; promotion aborted"
-            )
-        os.replace(temporary_path, destination)  # noqa: PTH105
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            with suppress(OSError):
-                temporary_path.unlink()
+        candidate=candidate,
+        incumbent=incumbent,
+        promote_to=promote_to,
+        evaluator_builder=_build_evaluator,
+    ).report()
 
 
 def _run_search(
@@ -596,12 +517,12 @@ def _run_self_play(
     *,
     overwrite: bool,
     checkpoint: Path | None = None,
+    workers: int | None = None,
 ) -> dict[str, object]:
     """Generate a complete game batch, then atomically update replay storage."""
 
-    from azgo.game import Color
+    from azgo.operations import generate_self_play
     from azgo.replay import ReplayBuffer, ReplayError
-    from azgo.self_play import SelfPlayRunner
 
     output = output.expanduser().resolve()
     if output.exists() and not overwrite:
@@ -617,44 +538,15 @@ def _run_self_play(
                 "existing replay metadata does not match configuration: "
                 f"expected board_size/history_length/capacity {expected}, got {actual}"
             )
-    else:
-        buffer = ReplayBuffer(
-            board_size=settings.game.board_size,
-            history_length=settings.model.history_length,
-            capacity=settings.replay.capacity,
-        )
-
-    evaluator, evaluator_name, checkpoint_step = _build_evaluator(settings, checkpoint)
-    runner = SelfPlayRunner(evaluator, settings)
-    first_game_index = buffer.next_game_index
-    games = [
-        runner.play_game(first_game_index + offset)
-        for offset in range(settings.self_play.games)
-    ]
-
-    positions_generated = sum(len(game.samples) for game in games)
-    black_wins = sum(game.winner is Color.BLACK for game in games)
-    white_wins = sum(game.winner is Color.WHITE for game in games)
-    draws = sum(game.winner is None for game in games)
-
-    for game in games:
-        buffer.add_game(game)
-    buffer.save(output)
-
-    return {
-        "black_wins": black_wins,
-        "board_size": settings.game.board_size,
-        "checkpoint_step": checkpoint_step,
-        "draws": draws,
-        "evaluator": evaluator_name,
-        "games_generated": len(games),
-        "next_game_index": buffer.next_game_index,
-        "output": str(output),
-        "positions_generated": positions_generated,
-        "replay_capacity": buffer.capacity,
-        "replay_size": len(buffer),
-        "white_wins": white_wins,
-    }
+    base_replay = output if output.exists() and not overwrite else None
+    return generate_self_play(
+        settings,
+        output,
+        checkpoint=checkpoint,
+        base_replay=base_replay,
+        workers=workers,
+        evaluator_builder=_build_evaluator,
+    ).report()
 
 
 def _training_failures() -> tuple[type[Exception], ...]:
@@ -677,12 +569,8 @@ def _run_training(
 ) -> dict[str, object]:
     """Run the configured number of deterministic CPU learner updates."""
 
-    import numpy as np
-    import torch
-
-    from azgo.checkpoint import load_checkpoint, save_checkpoint
-    from azgo.learner import Learner, TrainingError, TrainingMetrics
-    from azgo.replay import ReplayBuffer
+    from azgo.learner import TrainingError
+    from azgo.operations import train_network
 
     replay_path = replay_path.expanduser().resolve()
     checkpoint_path = checkpoint_path.expanduser().resolve()
@@ -695,80 +583,10 @@ def _run_training(
             "checkpoint already exists; pass --resume to continue it or --overwrite to replace it"
         )
 
-    replay = ReplayBuffer.load(replay_path)
-    expected_replay = (settings.game.board_size, settings.model.history_length)
-    actual_replay = (replay.board_size, replay.history_length)
-    if actual_replay != expected_replay:
-        raise TrainingError(
-            "replay metadata does not match configuration: "
-            f"expected board_size/history_length {expected_replay}, got {actual_replay}"
-        )
-    if len(replay) < settings.learner.batch_size:
-        raise TrainingError(
-            f"replay size {len(replay)} is smaller than batch_size "
-            f"{settings.learner.batch_size}"
-        )
-
-    torch.manual_seed(settings.learner.seed)
-    network = _build_network(settings)
-    learner = Learner(network, settings)
-    if resume:
-        metadata = load_checkpoint(
-            checkpoint_path,
-            network=network,
-            config=settings,
-            optimizer=learner.optimizer,
-            restore_rng=True,
-        )
-        learner.restore_step(metadata.step)
-
-    start_step = learner.step
-    metrics: list[TrainingMetrics] = []
-    for _ in range(settings.learner.steps):
-        sample_seed = int(
-            np.random.SeedSequence([settings.learner.seed, learner.step]).generate_state(
-                1,
-                dtype=np.uint64,
-            )[0]
-        )
-        batch = replay.sample(
-            settings.learner.batch_size,
-            sample_seed,
-            augment=settings.learner.augment,
-        )
-        metric = learner.train_step(batch)
-        metrics.append(metric)
-        if metric.step % settings.learner.checkpoint_interval == 0:
-            save_checkpoint(
-                checkpoint_path,
-                network=network,
-                optimizer=learner.optimizer,
-                step=learner.step,
-                config=settings,
-            )
-
-    save_checkpoint(
+    return train_network(
+        settings,
+        replay_path,
         checkpoint_path,
-        network=network,
-        optimizer=learner.optimizer,
-        step=learner.step,
-        config=settings,
-    )
-    final = metrics[-1]
-    count = len(metrics)
-    return {
-        "board_size": settings.game.board_size,
-        "checkpoint": str(checkpoint_path),
-        "end_step": learner.step,
-        "final_gradient_norm": final.gradient_norm,
-        "final_policy_loss": final.policy_loss,
-        "final_total_loss": final.total_loss,
-        "final_value_loss": final.value_loss,
-        "mean_policy_loss": sum(item.policy_loss for item in metrics) / count,
-        "mean_total_loss": sum(item.total_loss for item in metrics) / count,
-        "mean_value_loss": sum(item.value_loss for item in metrics) / count,
-        "replay_size": len(replay),
-        "resumed": resume,
-        "start_step": start_step,
-        "steps_completed": learner.step - start_step,
-    }
+        source_checkpoint=checkpoint_path if resume else None,
+        network_factory=_build_network,
+    ).report()

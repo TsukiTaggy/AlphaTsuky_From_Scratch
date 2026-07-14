@@ -42,10 +42,13 @@ search:
 self_play:
   seed: 4343
   games: 2
+  workers: 2
   max_moves: 256
   temperature: 1.0
   temperature_moves: 10
   root_noise: true
+inference:
+  max_batch_size: 16
 replay:
   capacity: 10000
 learner:
@@ -65,6 +68,8 @@ arena:
   opening_moves: 4
   max_moves: 128
   promotion_threshold: 0.55
+training_run:
+  cycles: 1
 {extra}""",
         encoding="utf-8",
     )
@@ -89,10 +94,12 @@ def test_load_config_composes_and_validates_yaml(tmp_path: Path) -> None:
     assert config.search.dirichlet_fraction == 0.25
     assert config.self_play.seed == 4343
     assert config.self_play.games == 2
+    assert config.self_play.workers == 2
     assert config.self_play.max_moves == 256
     assert config.self_play.temperature == 1.0
     assert config.self_play.temperature_moves == 10
     assert config.self_play.root_noise is True
+    assert config.inference.max_batch_size == 16
     assert config.replay.capacity == 10000
     assert config.learner.seed == 5301
     assert config.learner.batch_size == 32
@@ -109,6 +116,7 @@ def test_load_config_composes_and_validates_yaml(tmp_path: Path) -> None:
     assert config.arena.opening_moves == 4
     assert config.arena.max_moves == 128
     assert config.arena.promotion_threshold == 0.55
+    assert config.training_run.cycles == 1
 
 
 @pytest.mark.parametrize("board_size", [5, 9, 13, 19])
@@ -125,10 +133,12 @@ def test_checked_in_engine_configurations_are_valid(board_size: int) -> None:
     assert config.search.dirichlet_fraction == 0.25
     assert config.self_play.seed == board_size * 1000 + 201
     assert config.self_play.games == 1
+    assert config.self_play.workers == 1
     assert config.self_play.max_moves == {5: 256, 9: 512, 13: 768, 19: 1024}[board_size]
     assert config.self_play.temperature == 1.0
     assert config.self_play.temperature_moves == {5: 10, 9: 20, 13: 30, 19: 30}[board_size]
     assert config.self_play.root_noise is True
+    assert config.inference.max_batch_size == 16
     assert config.replay.capacity == 10000
     assert config.learner.seed == board_size * 1000 + 301
     assert config.learner.batch_size == 32
@@ -145,6 +155,7 @@ def test_checked_in_engine_configurations_are_valid(board_size: int) -> None:
     assert config.arena.opening_moves == {5: 4, 9: 8, 13: 12, 19: 16}[board_size]
     assert config.arena.max_moves == {5: 256, 9: 512, 13: 768, 19: 1024}[board_size]
     assert config.arena.promotion_threshold == 0.55
+    assert config.training_run.cycles == 1
 
 
 def test_hydra_override_is_validated(tmp_path: Path) -> None:
@@ -362,6 +373,11 @@ def test_search_configuration_is_required(tmp_path: Path) -> None:
         ("games: 2", "games: -1"),
         ("games: 2", "games: 2.0"),
         ("games: 2", "games: true"),
+        ("workers: 2", "workers: 0"),
+        ("workers: 2", "workers: -1"),
+        ("workers: 2", "workers: 2.0"),
+        ("workers: 2", 'workers: "2"'),
+        ("workers: 2", "workers: true"),
         ("max_moves: 256", "max_moves: 1"),
         ("max_moves: 256", "max_moves: 256.0"),
         ("max_moves: 256", "max_moves: true"),
@@ -410,6 +426,17 @@ def test_temperature_moves_accepts_nonnegative_integers(
     assert load_config(path).self_play.temperature_moves == temperature_moves
 
 
+def test_self_play_workers_cannot_exceed_games(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("workers: 2", "workers: 3"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="workers"):
+        load_config(path)
+
+
 def test_unknown_self_play_configuration_is_rejected(tmp_path: Path) -> None:
     path = _write_config(tmp_path / "invalid.yaml")
     path.write_text(
@@ -428,6 +455,49 @@ def test_self_play_configuration_is_required(tmp_path: Path) -> None:
     path = _write_config(tmp_path / "invalid.yaml")
     contents = path.read_text(encoding="utf-8")
     start = contents.index("self_play:\n")
+    end = contents.index("replay:\n")
+    path.write_text(contents[:start] + contents[end:], encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize("max_batch_size", ["0", "-1", "16.0", '"16"', "true"])
+def test_invalid_inference_configuration_is_rejected(
+    tmp_path: Path,
+    max_batch_size: str,
+) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "max_batch_size: 16",
+            f"max_batch_size: {max_batch_size}",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_unknown_inference_configuration_is_rejected(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "  max_batch_size: 16",
+            "  max_batch_size: 16\n  unknown: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_inference_configuration_is_required(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    contents = path.read_text(encoding="utf-8")
+    start = contents.index("inference:\n")
     end = contents.index("replay:\n")
     path.write_text(contents[:start] + contents[end:], encoding="utf-8")
 
@@ -467,6 +537,17 @@ def test_replay_configuration_is_required(tmp_path: Path) -> None:
     path.write_text(contents[: contents.index("replay:\n")], encoding="utf-8")
 
     with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_replay_capacity_must_hold_one_learner_batch(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("capacity: 10000", "capacity: 31"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match=r"learner\.batch_size"):
         load_config(path)
 
 
@@ -514,6 +595,41 @@ def test_invalid_learner_configuration_is_rejected(
         path.read_text(encoding="utf-8").replace(original, replacement),
         encoding="utf-8",
     )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+@pytest.mark.parametrize("cycles", ["0", "-1", "1.0", '"1"', "true"])
+def test_invalid_training_run_cycles_are_rejected(tmp_path: Path, cycles: str) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("cycles: 1", f"cycles: {cycles}"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_unknown_training_run_configuration_is_rejected(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "  cycles: 1",
+            "  cycles: 1\n  unknown: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_training_run_configuration_is_required(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "invalid.yaml")
+    contents = path.read_text(encoding="utf-8")
+    path.write_text(contents[: contents.index("training_run:\n")], encoding="utf-8")
 
     with pytest.raises(ValidationError):
         load_config(path)

@@ -2,28 +2,45 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from pathlib import Path
-from typing import TYPE_CHECKING
+from threading import Event
+from threading import enumerate as enumerate_threads
+from time import sleep
+from typing import TYPE_CHECKING, Self
 
 import numpy as np
 import pytest
 
 from azgo.config import AppConfig, load_config
-from azgo.evaluator import EvaluationBatch
+from azgo.evaluator import EvaluationBatch, Evaluator
 from azgo.game import Color, GameState, Score
+from azgo.inference import (
+    DeterministicInferenceCoordinator,
+    InferenceClient,
+    InferenceClosedError,
+    InferenceMetrics,
+)
 from azgo.search import SearchResult
 from azgo.self_play import (
+    ParallelSelfPlayError,
+    ParallelSelfPlayResult,
+    ParallelSelfPlayRunner,
     SelfPlayError,
     SelfPlayGame,
     SelfPlayLimitError,
     SelfPlayRunner,
     TrainingSample,
+    _assigned_game_indices,
     _random_streams,
     _sample_with_temperature,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Iterable, Sequence
+    from concurrent.futures import Future
+    from types import TracebackType
 
 
 class PassEvaluator:
@@ -45,6 +62,9 @@ def _config(
     temperature_moves: int = 8,
     root_noise: bool = False,
     komi: float = 5.5,
+    games: int = 1,
+    workers: int = 1,
+    max_batch_size: int = 16,
 ) -> AppConfig:
     config = load_config(root / "configs" / "engine" / "go5.yaml")
     return config.model_copy(
@@ -57,7 +77,12 @@ def _config(
                     "temperature": temperature,
                     "temperature_moves": temperature_moves,
                     "root_noise": root_noise,
+                    "games": games,
+                    "workers": workers,
                 }
+            ),
+            "inference": config.inference.model_copy(
+                update={"max_batch_size": max_batch_size}
             ),
         }
     )
@@ -381,3 +406,370 @@ def test_self_play_game_normalizes_tuples_and_validates_alignment() -> None:
         SelfPlayGame((_sample(value=1.0),), (25,), score, Color.WHITE, 3)
     with pytest.raises(SelfPlayError, match="final_score"):
         SelfPlayGame((first,), (25,), score, Color.BLACK, 3)
+
+
+def _assert_same_games(
+    actual: tuple[SelfPlayGame, ...],
+    expected: tuple[SelfPlayGame, ...],
+) -> None:
+    assert [game.game_index for game in actual] == [game.game_index for game in expected]
+    for actual_game, expected_game in zip(actual, expected, strict=True):
+        assert actual_game.actions == expected_game.actions
+        assert actual_game.final_score == expected_game.final_score
+        for actual_sample, expected_sample in zip(
+            actual_game.samples,
+            expected_game.samples,
+            strict=True,
+        ):
+            np.testing.assert_array_equal(actual_sample.features, expected_sample.features)
+            np.testing.assert_array_equal(actual_sample.policy, expected_sample.policy)
+            assert actual_sample.value == expected_sample.value
+
+
+def test_parallel_runner_direct_mode_matches_existing_sequential_order_and_metrics(
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = _config(root, games=3, workers=1)
+    expected_runner = SelfPlayRunner(PassEvaluator(), config)
+    expected = tuple(expected_runner.play_game(index) for index in range(7, 10))
+
+    result = ParallelSelfPlayRunner(PassEvaluator(), config).play_games(7)
+
+    _assert_same_games(result.games, expected)
+    assert result.effective_workers == 1
+    assert result.inference_mode == "direct"
+    assert result.inference_metrics.requests > 0
+    assert result.inference_metrics.positions == result.inference_metrics.requests
+    assert result.inference_metrics.batches == result.inference_metrics.requests
+    assert result.inference_metrics.max_batch_size == 1
+    assert result.inference_metrics.mean_batch_size == 1.0
+
+
+def test_fixed_stride_worker_assignments_cover_range_exactly_once() -> None:
+    assignments = tuple(
+        tuple(
+            _assigned_game_indices(
+                11,
+                10,
+                worker_id=worker_id,
+                workers=4,
+            )
+        )
+        for worker_id in range(4)
+    )
+
+    assert assignments == (
+        (11, 15, 19),
+        (12, 16, 20),
+        (13, 17),
+        (14, 18),
+    )
+    assert sorted(index for assignment in assignments for index in assignment) == list(
+        range(11, 21)
+    )
+
+
+def test_parallel_mode_sorts_games_matches_sequential_and_batches_workers() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = _config(root, games=4, workers=4, max_batch_size=16)
+    expected = tuple(
+        SelfPlayRunner(PassEvaluator(), config).play_game(index) for index in range(3, 7)
+    )
+
+    result = ParallelSelfPlayRunner(PassEvaluator(), config).play_games(3)
+
+    _assert_same_games(result.games, expected)
+    assert tuple(game.game_index for game in result.games) == (3, 4, 5, 6)
+    assert result.effective_workers == 4
+    assert result.inference_mode == "deterministic_batch"
+    assert result.inference_metrics.requests > result.inference_metrics.batches
+    assert result.inference_metrics.positions == result.inference_metrics.requests
+    assert result.inference_metrics.max_batch_size == 4
+    assert result.inference_metrics.mean_batch_size == 4.0
+
+
+def test_parallel_mode_is_repeatable_despite_delayed_game_worker_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = _config(
+        root,
+        games=4,
+        workers=4,
+        root_noise=True,
+        temperature_moves=8,
+    )
+    original = SelfPlayRunner.play_game
+
+    def delayed_play_game(self: SelfPlayRunner, game_index: int) -> SelfPlayGame:
+        sleep((game_index % 4) * 0.002)
+        return original(self, game_index)
+
+    monkeypatch.setattr(SelfPlayRunner, "play_game", delayed_play_game)
+
+    first = ParallelSelfPlayRunner(PassEvaluator(), config).play_games(20)
+    second = ParallelSelfPlayRunner(PassEvaluator(), config).play_games(20)
+
+    _assert_same_games(first.games, second.games)
+    assert first.inference_metrics == second.inference_metrics
+
+
+@pytest.mark.parametrize("workers", [True, 0, -1, 4, "2"])
+def test_parallel_runner_rejects_invalid_worker_overrides(workers: object) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = _config(root, games=3, workers=1)
+
+    with pytest.raises(ParallelSelfPlayError, match="workers"):
+        ParallelSelfPlayRunner(PassEvaluator(), config, workers=workers)  # type: ignore[arg-type]
+
+
+def test_parallel_runner_uses_configured_workers_and_validates_constructor_types() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = _config(root, games=3, workers=2)
+
+    runner = ParallelSelfPlayRunner(PassEvaluator(), config)
+
+    assert runner.effective_workers == 2
+    with pytest.raises(TypeError, match="evaluator"):
+        ParallelSelfPlayRunner(object(), config)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="AppConfig"):
+        ParallelSelfPlayRunner(PassEvaluator(), object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "first_game_index",
+    [-1, True, 1 << 64],
+)
+def test_parallel_runner_rejects_invalid_first_game_index(
+    first_game_index: object,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    runner = ParallelSelfPlayRunner(
+        PassEvaluator(),
+        _config(root, games=2, workers=1),
+    )
+
+    with pytest.raises(ParallelSelfPlayError, match="first_game_index"):
+        runner.play_games(first_game_index)  # type: ignore[arg-type]
+
+
+def test_parallel_runner_rejects_final_game_index_overflow_before_evaluation() -> None:
+    root = Path(__file__).resolve().parents[1]
+
+    class UnexpectedEvaluator:
+        def evaluate_batch(self, states: Sequence[GameState]) -> EvaluationBatch:
+            del states
+            pytest.fail("overflow must be rejected before evaluation")
+
+    runner = ParallelSelfPlayRunner(
+        UnexpectedEvaluator(),
+        _config(root, games=2, workers=1),
+    )
+
+    with pytest.raises(ParallelSelfPlayError, match="exceeds"):
+        runner.play_games((1 << 64) - 1)
+
+
+def test_evaluator_failure_aborts_parallel_batch_and_releases_all_threads() -> None:
+    root = Path(__file__).resolve().parents[1]
+    failure = RuntimeError("model unavailable")
+
+    class FailingEvaluator:
+        def evaluate_batch(self, states: Sequence[GameState]) -> EvaluationBatch:
+            del states
+            raise failure
+
+    runner = ParallelSelfPlayRunner(
+        FailingEvaluator(),
+        _config(root, games=4, workers=4),
+    )
+
+    with pytest.raises(ParallelSelfPlayError, match="parallel") as captured:
+        runner.play_games(0)
+
+    assert captured.value.__cause__ is failure
+    assert not any(
+        thread.name.startswith(("azgo-self-play", "azgo-deterministic-inference"))
+        for thread in enumerate_threads()
+    )
+
+
+def test_partial_executor_submission_aborts_before_shutdown_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    request_started = Event()
+    submission_failure = RuntimeError("worker submission failed")
+    watchdog_failure = RuntimeError("executor exit reached before coordinator abort")
+    coordinators: list[TrackingCoordinator] = []
+    abort_missing_at_exit: list[bool] = []
+    original_client_evaluate = InferenceClient.evaluate_batch
+
+    class TrackingCoordinator(DeterministicInferenceCoordinator):
+        def __init__(
+            self,
+            evaluator: Evaluator,
+            *,
+            max_batch_size: int,
+            client_ids: Iterable[int],
+        ) -> None:
+            super().__init__(
+                evaluator,
+                max_batch_size=max_batch_size,
+                client_ids=client_ids,
+            )
+            self.abort_called = Event()
+            coordinators.append(self)
+
+        def abort(self, cause: BaseException) -> None:
+            self.abort_called.set()
+            super().abort(cause)
+
+    class FaultInjectingExecutor:
+        def __init__(self, *, max_workers: int, thread_name_prefix: str) -> None:
+            self._executor = RealThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix=thread_name_prefix,
+            )
+            self._submissions = 0
+
+        def __enter__(self) -> Self:
+            self._executor.__enter__()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> bool | None:
+            coordinator = coordinators[0]
+            missing = not coordinator.abort_called.is_set()
+            abort_missing_at_exit.append(missing)
+            if missing:
+                # Watchdog cleanup makes the regression fail without hanging pytest.
+                coordinator.abort(watchdog_failure)
+            return self._executor.__exit__(exc_type, exc_value, traceback)
+
+        def submit(
+            self,
+            function: Callable[[int], tuple[SelfPlayGame, ...]],
+            worker_id: int,
+        ) -> Future[tuple[SelfPlayGame, ...]]:
+            self._submissions += 1
+            if self._submissions == 2:
+                raise submission_failure
+            future = self._executor.submit(function, worker_id)
+            assert request_started.wait(timeout=2.0)
+            return future
+
+    def signaling_evaluate(
+        client: InferenceClient,
+        states: Sequence[GameState],
+    ) -> EvaluationBatch:
+        request_started.set()
+        return original_client_evaluate(client, states)
+
+    monkeypatch.setattr(
+        "azgo.self_play.DeterministicInferenceCoordinator",
+        TrackingCoordinator,
+    )
+    monkeypatch.setattr("azgo.self_play.ThreadPoolExecutor", FaultInjectingExecutor)
+    monkeypatch.setattr(InferenceClient, "evaluate_batch", signaling_evaluate)
+    runner = ParallelSelfPlayRunner(
+        PassEvaluator(),
+        _config(root, games=4, workers=4),
+    )
+
+    with pytest.raises(ParallelSelfPlayError, match="worker submission failed") as captured:
+        runner.play_games(0)
+
+    assert captured.value.__cause__ is submission_failure
+    assert abort_missing_at_exit == [False]
+    assert len(coordinators) == 1
+    for client_id in range(4):
+        with pytest.raises(InferenceClosedError):
+            coordinators[0].client(client_id)
+    assert not any(
+        thread.name.startswith(("azgo-self-play", "azgo-deterministic-inference"))
+        for thread in enumerate_threads()
+    )
+
+
+def test_direct_evaluator_failure_preserves_actionable_root_cause() -> None:
+    root = Path(__file__).resolve().parents[1]
+    failure = RuntimeError("direct model unavailable")
+
+    class FailingEvaluator:
+        def evaluate_batch(self, states: Sequence[GameState]) -> EvaluationBatch:
+            del states
+            raise failure
+
+    runner = ParallelSelfPlayRunner(
+        FailingEvaluator(),
+        _config(root, games=1, workers=1),
+    )
+
+    with pytest.raises(ParallelSelfPlayError, match="direct model unavailable") as captured:
+        runner.play_games(0)
+
+    assert captured.value.__cause__ is failure
+
+
+def test_game_failure_aborts_all_workers_and_never_returns_partial_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = _config(root, games=4, workers=4)
+    failure = SelfPlayLimitError("forced game failure")
+    original = SelfPlayRunner.play_game
+    completed: list[int] = []
+
+    def failing_play_game(self: SelfPlayRunner, game_index: int) -> SelfPlayGame:
+        if game_index == 2:
+            raise failure
+        game = original(self, game_index)
+        completed.append(game_index)
+        return game
+
+    monkeypatch.setattr(SelfPlayRunner, "play_game", failing_play_game)
+
+    with pytest.raises(ParallelSelfPlayError, match="parallel") as captured:
+        ParallelSelfPlayRunner(PassEvaluator(), config).play_games(0)
+
+    assert captured.value.__cause__ is failure
+    assert len(completed) < config.self_play.games
+    assert not any(
+        thread.name.startswith(("azgo-self-play", "azgo-deterministic-inference"))
+        for thread in enumerate_threads()
+    )
+
+
+def test_parallel_result_is_frozen_and_rejects_unsorted_or_invalid_metadata() -> None:
+    root = Path(__file__).resolve().parents[1]
+    games = tuple(
+        SelfPlayRunner(PassEvaluator(), _config(root)).play_game(index)
+        for index in (1, 2)
+    )
+    metrics = InferenceMetrics(2, 2, 1, 2, 2.0)
+    result = ParallelSelfPlayResult(games, 2, "deterministic_batch", metrics)
+
+    assert result.games == games
+    with pytest.raises(FrozenInstanceError):
+        result.effective_workers = 1  # type: ignore[misc]
+    with pytest.raises(ParallelSelfPlayError, match="contiguous"):
+        ParallelSelfPlayResult(tuple(reversed(games)), 2, "deterministic_batch", metrics)
+    with pytest.raises(ParallelSelfPlayError, match="effective_workers"):
+        ParallelSelfPlayResult(games, 0, "deterministic_batch", metrics)
+    with pytest.raises(ParallelSelfPlayError, match="number of games"):
+        ParallelSelfPlayResult(games, 3, "deterministic_batch", metrics)
+    with pytest.raises(ParallelSelfPlayError, match="inference_mode"):
+        ParallelSelfPlayResult(games, 1, "deterministic_batch", metrics)
+    with pytest.raises(ParallelSelfPlayError, match="inference_mode"):
+        ParallelSelfPlayResult(games, 2, "direct", metrics)
+    with pytest.raises(ParallelSelfPlayError, match="inference_mode"):
+        ParallelSelfPlayResult(games, 2, "timed", metrics)  # type: ignore[arg-type]
+
+    noncontiguous = (games[0], SelfPlayRunner(PassEvaluator(), _config(root)).play_game(3))
+    with pytest.raises(ParallelSelfPlayError, match="contiguous"):
+        ParallelSelfPlayResult(noncontiguous, 2, "deterministic_batch", metrics)

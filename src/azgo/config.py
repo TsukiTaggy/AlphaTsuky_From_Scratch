@@ -135,6 +135,7 @@ class SelfPlayConfig(BaseModel):
 
     seed: Seed
     games: PositiveStrictInt
+    workers: PositiveStrictInt
     max_moves: MoveLimitStrictInt
     temperature: PositiveFiniteStrictFloat
     temperature_moves: NonNegativeStrictInt
@@ -148,6 +149,22 @@ class SelfPlayConfig(BaseModel):
         if type(value) is not float:
             raise ValueError("temperature must be a floating-point number")
         return value
+
+    @model_validator(mode="after")
+    def validate_workers(self) -> Self:
+        """Require every worker to own at least one configured game."""
+
+        if self.workers > self.games:
+            raise ValueError("workers must be less than or equal to games")
+        return self
+
+
+class InferenceConfig(BaseModel):
+    """Validated settings for deterministic coordinated model inference."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    max_batch_size: PositiveStrictInt
 
 
 class ReplayConfig(BaseModel):
@@ -220,8 +237,16 @@ class ArenaConfig(BaseModel):
         return self
 
 
+class TrainingRunConfig(BaseModel):
+    """Validated settings for a bounded resumable AlphaZero training run."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    cycles: PositiveStrictInt
+
+
 class AppConfig(BaseModel):
-    """Complete validated configuration for Phases 1 through 7."""
+    """Complete validated configuration for Phases 1 through 9."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -231,9 +256,19 @@ class AppConfig(BaseModel):
     model: ModelConfig
     search: SearchConfig
     self_play: SelfPlayConfig
+    inference: InferenceConfig
     replay: ReplayConfig
     learner: LearnerConfig
     arena: ArenaConfig
+    training_run: TrainingRunConfig
+
+    @model_validator(mode="after")
+    def validate_training_run_capacity(self) -> Self:
+        """Guarantee that a full learner batch can fit in persistent replay."""
+
+        if self.replay.capacity < self.learner.batch_size:
+            raise ValueError("replay.capacity must be greater than or equal to learner.batch_size")
+        return self
 
 
 _APP_CONFIG_ADAPTER = TypeAdapter(AppConfig)
@@ -276,6 +311,6 @@ def validate_config(config: DictConfig) -> AppConfig:
 
 
 def load_config(path: str | Path, overrides: tuple[str, ...] = ()) -> AppConfig:
-    """Compose and validate a Phase 1-7 YAML configuration."""
+    """Compose and validate a Phase 1-9 YAML configuration."""
 
     return validate_config(compose_config(path, overrides))

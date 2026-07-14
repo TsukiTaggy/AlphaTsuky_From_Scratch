@@ -313,10 +313,7 @@ def _validate_payload(
         raise CheckpointError("checkpoint config must be a dictionary")
     _validate_primitive(saved_config, "config")
     typed_saved_config = cast("dict[str, object]", saved_config)
-    config_for_validation = typed_saved_config
-    if "arena" not in typed_saved_config:
-        config_for_validation = copy.deepcopy(typed_saved_config)
-        config_for_validation["arena"] = config.arena.model_dump(mode="json")
+    config_for_validation = _normalize_legacy_config(typed_saved_config, config)
     try:
         validated_saved_config = AppConfig.model_validate(config_for_validation)
     except ValidationError as exc:
@@ -340,6 +337,31 @@ def _validate_payload(
     )
 
     return typed_payload
+
+
+def _normalize_legacy_config(
+    saved_config: dict[str, object],
+    current_config: AppConfig,
+) -> dict[str, object]:
+    """Add only sanctioned operational defaults to a detached validation copy."""
+
+    normalized = copy.deepcopy(saved_config)
+    if "arena" not in normalized:
+        normalized["arena"] = current_config.arena.model_dump(mode="json")
+    if "inference" not in normalized:
+        normalized["inference"] = current_config.inference.model_dump(mode="json")
+    if "training_run" not in normalized:
+        normalized["training_run"] = current_config.training_run.model_dump(mode="json")
+
+    self_play = normalized.get("self_play")
+    if type(self_play) is dict and "workers" not in self_play:
+        typed_self_play = cast("dict[str, object]", self_play)
+        saved_games = typed_self_play.get("games")
+        legacy_workers = current_config.self_play.workers
+        if type(saved_games) is int and saved_games >= 1:
+            legacy_workers = min(legacy_workers, saved_games)
+        typed_self_play["workers"] = legacy_workers
+    return normalized
 
 
 def _validate_model_state(raw: object, network: PolicyValueNetwork) -> None:
