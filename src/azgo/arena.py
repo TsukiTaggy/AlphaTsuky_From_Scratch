@@ -40,6 +40,7 @@ class ArenaGameResult:
     game_index: int
     candidate_color: Color
     opening_actions: tuple[int, ...]
+    actions: tuple[int, ...]
     move_count: int
     final_score: Score
     winner: Color | None
@@ -63,6 +64,10 @@ class ArenaGameResult:
             opening_actions = tuple(self.opening_actions)
         except TypeError as exc:
             raise ArenaError("opening_actions must be iterable") from exc
+        try:
+            actions = tuple(self.actions)
+        except TypeError as exc:
+            raise ArenaError("actions must be iterable") from exc
 
         point_count = _validate_score(self.final_score)
         for index, action in enumerate(opening_actions):
@@ -70,11 +75,22 @@ class ArenaGameResult:
             if normalized_action >= point_count:
                 raise ArenaError("opening_actions must contain only non-pass board actions")
 
+        for index, action in enumerate(actions):
+            normalized_action = _nonnegative_integer(action, f"actions[{index}]")
+            if normalized_action > point_count:
+                raise ArenaError(f"actions must be in [0, {point_count}]")
+
         move_count = _nonnegative_integer(self.move_count, "move_count")
-        if move_count < len(opening_actions) + 2:
+        if move_count != len(actions):
+            raise ArenaError("move_count must equal the complete action count")
+        if actions[: len(opening_actions)] != opening_actions:
+            raise ArenaError("opening_actions must be the prefix of actions")
+        if len(actions) < len(opening_actions) + 2:
             raise ArenaError(
                 "move_count must include the opening and the two passes needed to terminate"
             )
+        if actions[-2:] != (point_count, point_count):
+            raise ArenaError("actions must terminate with two consecutive passes")
 
         if self.winner is not None and (
             not isinstance(self.winner, Color) or self.winner is Color.EMPTY
@@ -91,6 +107,7 @@ class ArenaGameResult:
         object.__setattr__(self, "pair_index", pair_index)
         object.__setattr__(self, "game_index", game_index)
         object.__setattr__(self, "opening_actions", opening_actions)
+        object.__setattr__(self, "actions", actions)
         object.__setattr__(self, "move_count", move_count)
         object.__setattr__(self, "candidate_outcome", candidate_outcome)
 
@@ -279,6 +296,7 @@ class ArenaRunner:
             candidate_search.reset(opening_state)
             incumbent_search.reset(opening_state)
             state = opening_state
+            actions = list(opening_actions)
             while not state.is_terminal:
                 if state.move_number >= self._config.arena.max_moves:
                     raise ArenaLimitError(
@@ -295,6 +313,7 @@ class ArenaRunner:
                 if candidate_state != incumbent_state:
                     raise ArenaGameError("candidate and incumbent search trees diverged")
                 state = candidate_state
+                actions.append(action)
         except ArenaLimitError:
             raise
         except ArenaGameError:
@@ -309,6 +328,7 @@ class ArenaRunner:
             game_index=game_index,
             candidate_color=candidate_color,
             opening_actions=opening_actions,
+            actions=tuple(actions),
             move_count=state.move_number,
             final_score=final_score,
             winner=winner,

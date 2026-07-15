@@ -349,6 +349,42 @@ def _self_play_game(game_index: int, winner: Color | None) -> SelfPlayGame:
     )
 
 
+def _pass_self_play_game(game_index: int) -> SelfPlayGame:
+    from azgo.game import Color, GameState, Rules
+    from azgo.self_play import SelfPlayGame, TrainingSample
+
+    rules = Rules(board_size=5, komi=5.5)
+    actions = (rules.pass_action, rules.pass_action)
+    state = GameState.new(rules, zobrist_seed=7)
+    for action in actions:
+        state = state.apply(action)
+    score = state.score()
+    samples = []
+    for move_number, (to_play, action) in enumerate(
+        zip((Color.BLACK, Color.WHITE), actions, strict=True)
+    ):
+        policy = np.zeros(rules.action_size, dtype=np.float32)
+        policy[action] = 1.0
+        samples.append(
+            TrainingSample(
+                features=np.zeros((17, 5, 5), dtype=np.float32),
+                policy=policy,
+                value=float(score.outcome(to_play)),
+                to_play=to_play,
+                move_number=move_number,
+                selected_action=action,
+                game_index=game_index,
+            )
+        )
+    return SelfPlayGame(
+        samples=tuple(samples),
+        actions=actions,
+        final_score=score,
+        winner=score.winner,
+        game_index=game_index,
+    )
+
+
 def _install_fake_self_play_runner(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     from azgo import self_play
     from azgo.game import Color
@@ -417,6 +453,97 @@ def test_generate_self_play_creates_snapshot_and_reports_batch(
     loaded = ReplayBuffer.load(output)
     assert len(loaded) == 6
     assert loaded.next_game_index == 3
+
+
+def test_generate_self_play_writes_sgf_and_inspect_command_validates_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo import self_play
+
+    class PassRunner:
+        def __init__(self, evaluator: object, config: object) -> None:
+            del evaluator, config
+
+        def play_game(self, game_index: int) -> SelfPlayGame:
+            return _pass_self_play_game(game_index)
+
+    monkeypatch.setattr(self_play, "SelfPlayRunner", PassRunner)
+    config = _config(tmp_path / "test.yaml")
+    replay = tmp_path / "replay.npz"
+    sgf = tmp_path / "records" / "self-play.sgf"
+
+    generated = CliRunner().invoke(
+        app,
+        [
+            "generate-self-play",
+            "-c",
+            str(config),
+            "-o",
+            str(replay),
+            "--sgf-output",
+            str(sgf),
+        ],
+    )
+
+    assert generated.exit_code == 0, generated.output
+    report = json.loads(generated.output)
+    assert report["sgf_output"] == str(sgf.resolve())
+    assert report["sgf_sha256"] == sha256(sgf.read_bytes()).hexdigest()
+    inspected = CliRunner().invoke(
+        app,
+        ["inspect-sgf", "-c", str(config), "--input", str(sgf)],
+    )
+    assert inspected.exit_code == 0, inspected.output
+    inspection = json.loads(inspected.output)
+    assert inspection["games_count"] == 1
+    assert inspection["games"][0]["move_count"] == 2
+    assert inspection["games"][0]["winner"] == "white"
+    assert inspection["games"][0]["game_name"] == "self-play-00000000000000000000"
+
+
+def test_self_play_sgf_bytes_are_independent_of_worker_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo import self_play
+
+    class PassRunner:
+        def __init__(self, evaluator: object, config: object) -> None:
+            del evaluator, config
+
+        def play_game(self, game_index: int) -> SelfPlayGame:
+            return _pass_self_play_game(game_index)
+
+    monkeypatch.setattr(self_play, "SelfPlayRunner", PassRunner)
+    config = _config(tmp_path / "test.yaml")
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  games: 1\n  workers: 1\n  max_moves: 256",
+            "  games: 3\n  workers: 1\n  max_moves: 256",
+        ),
+        encoding="utf-8",
+    )
+    sgf_paths = (tmp_path / "single.sgf", tmp_path / "parallel.sgf")
+
+    for index, workers in enumerate((1, 2)):
+        result = CliRunner().invoke(
+            app,
+            [
+                "generate-self-play",
+                "-c",
+                str(config),
+                "-o",
+                str(tmp_path / f"replay-{index}.npz"),
+                "--workers",
+                str(workers),
+                "--sgf-output",
+                str(sgf_paths[index]),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    assert sgf_paths[0].read_bytes() == sgf_paths[1].read_bytes()
 
 
 def test_generate_self_play_worker_override_uses_parallel_mode(
@@ -1130,7 +1257,7 @@ def _fake_arena_result(
 def _install_fake_arena(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    result: SimpleNamespace | None = None,
+    result: object | None = None,
     load_error: Exception | None = None,
     on_run: Callable[[], object] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -1187,7 +1314,7 @@ def _install_fake_arena(
                 }
             )
 
-        def run(self) -> SimpleNamespace:
+        def run(self) -> object:
             if on_run is not None:
                 on_run()
             return arena_result
@@ -1270,6 +1397,69 @@ def test_evaluate_arena_reports_identities_results_and_compact_games(
     assert len(runners) == 1
     assert runners[0]["candidate"] is loads[0]["network"]
     assert runners[0]["incumbent"] is loads[1]["network"]
+
+
+def test_evaluate_arena_writes_complete_color_swapped_sgf_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgo.arena import ArenaGameResult, ArenaResult
+    from azgo.game import Color, GameState, Rules
+    from azgo.sgf import load_sgf_collection
+
+    config = _config(tmp_path / "test.yaml")
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    sgf = tmp_path / "arena.sgf"
+    candidate.write_bytes(b"candidate checkpoint")
+    incumbent.write_bytes(b"incumbent checkpoint")
+    rules = Rules(board_size=5, komi=5.5)
+    state = GameState.new(rules, zobrist_seed=7).apply(25).apply(25)
+    score = state.score()
+    games = (
+        ArenaGameResult(
+            pair_index=0,
+            game_index=0,
+            candidate_color=Color.BLACK,
+            opening_actions=(),
+            actions=(25, 25),
+            move_count=2,
+            final_score=score,
+            winner=Color.WHITE,
+            candidate_outcome="loss",
+        ),
+        ArenaGameResult(
+            pair_index=0,
+            game_index=1,
+            candidate_color=Color.WHITE,
+            opening_actions=(),
+            actions=(25, 25),
+            move_count=2,
+            final_score=score,
+            winner=Color.WHITE,
+            candidate_outcome="win",
+        ),
+    )
+    _install_fake_arena(monkeypatch, result=ArenaResult(games, 0.55))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            *_arena_command(config, candidate, incumbent),
+            "--sgf-output",
+            str(sgf),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    assert report["sgf_output"] == str(sgf.resolve())
+    assert report["sgf_sha256"] == sha256(sgf.read_bytes()).hexdigest()
+    records = load_sgf_collection(sgf, expected_rules=rules, zobrist_seed=7)
+    assert len(records) == 2
+    assert records[0].actions == records[1].actions == (25, 25)
+    assert records[0].black_player.startswith("candidate-")
+    assert records[1].white_player.startswith("candidate-")
 
 
 @pytest.mark.parametrize(

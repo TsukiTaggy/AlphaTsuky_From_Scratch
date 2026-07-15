@@ -1,13 +1,14 @@
 # alphazero-go
 
 `alphazero-go` is a correctness-first, research-oriented implementation of an
-AlphaZero-style Go system. The current Phase 1-9 milestone contains the Python
+AlphaZero-style Go system. The current Phase 1-10 milestone contains the Python
 project foundation, validated configuration, a PyTorch-independent Go rules
 engine, deterministic state encoding and board symmetries, and a CPU-first
 policy-value network with deterministic PUCT search, self-play generation,
 bounded replay storage, CPU training, resumable checkpoints, paired arena
 evaluation, deterministic concurrent inference for parallel self-play, and
-crash-safe orchestration of complete AlphaZero training runs. It is usable on
+crash-safe orchestration of complete AlphaZero training runs, plus deterministic
+SGF FF[4] game records. It is usable on
 5x5, 9x9, 13x13, and 19x19 boards.
 
 The longer-term project is intended to learn only from self-play and the rules
@@ -94,6 +95,11 @@ barriers ordered by worker ID rather than timing windows, so replay ordering and
 batch formation remain reproducible. The JSON report includes request, position,
 model-batch, mean-batch-size, and maximum-batch-size metrics.
 
+Add `--sgf-output records/self-play.sgf` to atomically write the complete
+generated games as a deterministic UTF-8 SGF collection. SGF records are
+inspection artifacts; replay snapshots remain the training source because they
+also contain normalized MCTS visit policies.
+
 Train the configured CPU network from a replay snapshot and create a checkpoint:
 
 ```console
@@ -120,6 +126,9 @@ half; the candidate is promotion-eligible when its score meets the configured
 inclusive threshold. The JSON report includes checkpoint hashes and steps,
 aggregate results, and compact per-game evidence.
 
+Add `--sgf-output records/arena.sgf` to preserve both complete color-swapped
+games in each pair, including their shared openings and checkpoint identities.
+
 Promotion is never implicit. Supplying an explicit destination atomically
 copies the evaluated candidate only when it passes the gate:
 
@@ -129,6 +138,18 @@ uv run azgo evaluate-arena -c configs/engine/go5.yaml --candidate checkpoints/ca
 
 If evaluation fails or the candidate misses the threshold, the destination is
 left unchanged.
+
+Validate and inspect a supported linear SGF collection against the configured
+engine rules:
+
+```console
+uv run azgo inspect-sgf -c configs/engine/go5.yaml --input records/self-play.sgf
+```
+
+The command replays every move through the Go engine and reports names, move
+counts, scores, results, and winners as JSON. Setup positions, handicap,
+variations, resignation, unfinished games, illegal moves, and incompatible
+rules are rejected.
 
 Run the complete configured self-play, learning, and arena cycle from a
 deterministically seeded step-zero network:
@@ -142,7 +163,9 @@ bootstrap and candidate checkpoints, alternates between two replay snapshots,
 and commits a versioned manifest after self-play, training, and arena stages.
 Only an arena-eligible candidate becomes the next incumbent; a rejected
 candidate is retained as evidence but never becomes the parent of later
-training.
+training. Every new cycle also journals `self-play.sgf` and `arena.sgf` with
+their hashes and game counts. Existing Phase 9 manifests migrate without
+fabricating records for already committed stages.
 
 After interruption, resume with the same configuration. Omitting `--workers`
 reuses the worker count recorded during initialization:
@@ -151,8 +174,8 @@ reuses the worker count recorded during initialization:
 uv run azgo run-training-cycle -c configs/engine/go5.yaml --run-dir runs/go5 --resume
 ```
 
-Resume validates configuration, paths, hashes, checkpoint compatibility, and
-replay metadata before doing work. A completed run resumes as a validated
+Resume validates configuration, paths, hashes, checkpoint compatibility,
+replay metadata, and committed SGF records before doing work. A completed run resumes as a validated
 no-op. Fresh mode refuses an existing directory, and concurrent writers are
 rejected through an operating-system lock.
 
@@ -172,7 +195,7 @@ Pydantic models before an engine is constructed. Unknown fields and invalid
 values are rejected.
 
 The current YAML contract contains only settings owned by implemented Phase
-1-9 subsystems:
+1-10 subsystems:
 
 - `game.board_size`: one of `5`, `9`, `13`, or `19`
 - `game.komi`: a finite number added to White's score
@@ -413,6 +436,8 @@ run/
   replays/replay-0.npz
   replays/replay-1.npz       # appears after the next cycle
   cycles/000001/candidate.pt
+  cycles/000001/self-play.sgf
+  cycles/000001/arena.sgf
   cycles/000002/candidate.pt
 ```
 
@@ -421,7 +446,7 @@ See [Go rules](docs/game_rules.md) for the normative rule contract and
 
 ## Development and verification
 
-Run every Phase 1-9 quality gate from the repository root:
+Run every Phase 1-10 quality gate from the repository root:
 
 ```console
 uv run ruff check .
@@ -453,6 +478,9 @@ Phase 9 coverage adds deterministic bootstrap, accepted and rejected candidate
 lineage, alternating replay artifacts, strict manifests and path containment,
 exclusive writer locking, stage-level failure recovery, corruption detection,
 configuration and worker resume checks, and completed-run no-op validation.
+Phase 10 coverage adds canonical SGF collections, engine-validated imports,
+complete self-play and arena records, atomic SGF output, CLI inspection,
+manifest artifact hashing, Phase 9 manifest migration, and SGF-aware recovery.
 
 The engine benchmark is intended for reproducible regression measurements.
 Profile evidence should precede internal optimization, and optimizations must

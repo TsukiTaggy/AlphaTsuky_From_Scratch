@@ -11,6 +11,7 @@ CPU learning, portable training checkpoints, and checkpoint-backed evaluation.
 Phase 7 adds paired arena evaluation and explicit checkpoint promotion. Phase
 8 adds deterministic concurrent inference and parallel self-play. Phase 9 adds
 typed workflow operations and crash-safe, resumable AlphaZero training runs.
+Phase 10 adds deterministic SGF FF[4] records and engine-validated import.
 This document describes only those implemented boundaries.
 
 ## Current package boundaries
@@ -29,6 +30,9 @@ azgo.cli ----> azgo.operations <---- azgo.training_run
                                            +----> azgo.inference       v
                                                       |       azgo.encoding
 azgo.network --------------------------------> azgo.evaluator   azgo.symmetry
+azgo.cli ------> azgo.sgf <------ azgo.operations <------ azgo.training_run
+                         |
+                         +------> azgo.game
 ```
 
 ### `azgo.game`
@@ -66,7 +70,7 @@ non-finite komi, unsupported rulesets, malformed seeds, and invalid benchmark
 workloads fail before engine construction. Code outside this boundary consumes
 validated typed settings rather than unstructured dictionaries.
 
-The Phase 1-9 schema covers only implemented behavior: board size, komi,
+The Phase 1-10 schema covers only implemented behavior: board size, komi,
 ruleset, Zobrist seed, benchmark workload, encoding history length, residual
 trunk width and depth, value-head hidden size, and PUCT search settings. Search
 configuration includes a simulation count, exploration constant, unsigned
@@ -82,6 +86,9 @@ position cap, while self-play also declares a worker count no greater than its
 game count. Training-run configuration declares an immutable positive total
 cycle target, and replay capacity must hold at least one learner batch.
 Distributed settings remain absent until their owning subsystem exists.
+
+Phase 10 adds no configuration fields: SGF serialization follows the validated
+game rules, while standalone record output remains an explicit CLI option.
 
 ### `azgo.encoding` and `azgo.symmetry`
 
@@ -231,17 +238,31 @@ temperature sampling. Each evaluator owns a reusable tree, and both trees
 advance through every action so they remain synchronized with the complete
 superko-aware game state.
 
-An immutable result records compact per-game evidence and aggregate candidate
+An immutable result records the complete action sequence, compact per-game evidence, and aggregate candidate
 wins, incumbent wins, draws, points, and score. Wins count as one point, draws
 as one half, and equality with the configured threshold is promotion-eligible.
 Opening, search, evaluator, and move-limit failures abort the entire run; the
 arena itself never mutates checkpoint files.
 
+### `azgo.sgf`
+
+`SgfGameRecord` represents one complete linear game as validated rules, ordered
+row-major actions, exact final score, and optional names. Construction replays
+the actions through `GameState`, requires normal two-pass termination, and
+checks the final score exactly.
+
+The codec emits deterministic UTF-8 SGF FF[4] collections with standard Go
+coordinates and empty move values for passes. Import accepts harmless
+annotations but rejects variations, setup stones, handicap, nonnumeric results,
+wrong player order, illegal moves, incompatible rules, and unfinished games.
+Atomic saves use same-directory temporary files, sync, and replacement. SGF
+records never become replay samples because they do not contain MCTS targets.
+
 ### `azgo.operations`
 
 The typed operation layer owns reusable process-local construction and file
 workflow boundaries for checkpoint bootstrap, replay generation, network
-training, checkpoint evaluation, hashing, and explicit promotion. Both the CLI
+training, checkpoint evaluation, SGF evidence, hashing, and explicit promotion. Both the CLI
 and managed training runner consume these operations, so command adapters and
 orchestration do not duplicate checkpoint or replay semantics. Existing
 standalone command JSON contracts are projections of immutable operation
@@ -263,6 +284,11 @@ candidate. Rejection retains evidence without advancing that pointer. Resume
 validates committed artifacts and regenerates only an output whose stage was
 not committed; corruption fails closed.
 
+Every newly recorded cycle also commits deterministic self-play and arena SGF
+collections with their relative paths, game counts, and SHA-256 identities.
+Phase 9 manifests migrate to version 2 without inventing historical records;
+recording begins at the next self-play stage whose actions are reproducible.
+
 ### `azgo.cli`
 
 The Typer command line is a thin adapter. It loads validated settings, creates
@@ -273,7 +299,8 @@ validation remain in `azgo.config`.
 The current commands validate configuration, benchmark legal engine play,
 analyze a move, generate self-play replay data, train a network from replay,
 evaluate candidate checkpoints in the arena, and create or resume a managed
-training run.
+training run. `inspect-sgf` validates supported collections through the engine
+and emits compact per-game JSON.
 The benchmark uses an explicit random seed and configured workload so runs can
 be reproduced. `search-move` can reconstruct a state from repeatable row-major
 actions and optionally enable seeded root noise; it emits a machine-readable
@@ -292,6 +319,8 @@ does not alter that destination.
 `generate-self-play` accepts an optional worker override and reports direct or
 deterministic-batch utilization. It still generates every requested game before
 changing replay storage.
+`generate-self-play` and `evaluate-arena` accept optional `--sgf-output` paths;
+managed cycles always record both collections.
 `run-training-cycle` executes the manifest's immutable cycle target. Fresh mode
 requires a nonexistent directory; resume requires the exact initialized
 configuration and either reuses the recorded worker count or rejects a
@@ -359,6 +388,13 @@ or records a rejection. Atomic manifest replacement is the commit boundary for
 each transition, so an output cannot become authoritative merely because its
 file exists.
 
+SGF export maps each row-major stone action to lowercase column/row coordinates
+and pass to an empty value. Import maps those values back to actions, replays
+the full sequence under the expected rules and Zobrist seed, and accepts the
+record only when normal termination and its declared numeric result match the
+engine score. Managed-run SGFs become authoritative only with the same manifest
+commit as their owning stage or cycle.
+
 ## Dependency and reproducibility rules
 
 - `azgo.game` must never import PyTorch or depend on a neural-network type.
@@ -384,6 +420,8 @@ file exists.
   lower-level model, engine, search, replay, and learner modules do not import it.
 - `azgo.training_run` consumes configuration and operations, owns manifest and
   locking policy, and never imports the CLI.
+- `azgo.sgf` consumes only the public game API and package version; the game
+  engine never imports serialization or workflow code.
 - Mutable process-wide singletons are not used for rules, configuration, or
   random-number generation.
 - Every stochastic operation accepts an explicit seed. Zobrist tables,
@@ -398,9 +436,10 @@ file exists.
 
 ## Deferred AlphaZero subsystems
 
-SGF export, external observability, and distributed workers are outside the Phase 1-9
-milestone. There are no placeholder
-implementations or configuration sections for them.
+External observability and distributed workers are outside the Phase 1-10
+milestone. There are no placeholder implementations or configuration sections
+for them. SGF variations, setup stones, handicap, resignation, and importing
+records as training samples are also deliberately unsupported.
 
 Their eventual dependency direction is constrained by the current boundary:
 they may consume the public Go engine, but the Go engine must not depend on

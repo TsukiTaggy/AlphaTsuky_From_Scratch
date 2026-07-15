@@ -18,18 +18,20 @@ from azgo import checkpoint as checkpoint_module
 from azgo import evaluator as evaluator_module
 from azgo import learner as learner_module
 from azgo.config import AppConfig
-from azgo.game import Color
+from azgo.game import Color, Rules, Ruleset
 from azgo.inference import InferenceMetrics
 from azgo.learner import TrainingError, TrainingMetrics
 from azgo.network import PolicyValueNetwork
 from azgo.replay import ReplayBuffer, ReplayError
 from azgo.self_play import ParallelSelfPlayRunner
+from azgo.sgf import SgfGameRecord, save_sgf_collection
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from azgo.arena import ArenaGameResult, ArenaResult
     from azgo.evaluator import Evaluator
+    from azgo.self_play import SelfPlayGame
 
 
 class OperationError(ValueError):
@@ -53,6 +55,15 @@ class CheckpointIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class SgfArtifactIdentity:
+    """Stable identity and game count for one SGF collection artifact."""
+
+    path: Path
+    sha256: str
+    games: int
+
+
+@dataclass(frozen=True, slots=True)
 class SelfPlayOperationResult:
     """Complete replay update and aggregate self-play measurements."""
 
@@ -72,12 +83,13 @@ class SelfPlayOperationResult:
     effective_workers: int
     inference_mode: str
     inference_metrics: InferenceMetrics
+    sgf: SgfArtifactIdentity | None = None
 
     def report(self) -> dict[str, object]:
         """Return the stable JSON-compatible command representation."""
 
         inference = self.inference_metrics
-        return {
+        report: dict[str, object] = {
             "black_wins": self.black_wins,
             "board_size": self.board_size,
             "checkpoint_step": self.checkpoint_step,
@@ -98,6 +110,10 @@ class SelfPlayOperationResult:
             "self_play_workers": self.effective_workers,
             "white_wins": self.white_wins,
         }
+        if self.sgf is not None:
+            report["sgf_output"] = str(self.sgf.path)
+            report["sgf_sha256"] = self.sgf.sha256
+        return report
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,12 +163,13 @@ class ArenaOperationResult:
     promotion_requested: bool
     promoted: bool
     promoted_to: Path | None
+    sgf: SgfArtifactIdentity | None = None
 
     def report(self) -> dict[str, object]:
         """Return the stable JSON-compatible command representation."""
 
         result = self.arena
-        return {
+        report: dict[str, object] = {
             "candidate": str(self.candidate.path),
             "candidate_points": float(result.candidate_points),
             "candidate_score": float(result.candidate_score),
@@ -172,6 +189,10 @@ class ArenaOperationResult:
             "promotion_requested": self.promotion_requested,
             "promotion_threshold": float(result.promotion_threshold),
         }
+        if self.sgf is not None:
+            report["sgf_output"] = str(self.sgf.path)
+            report["sgf_sha256"] = self.sgf.sha256
+        return report
 
 
 def build_network(config: AppConfig) -> PolicyValueNetwork:
@@ -238,6 +259,7 @@ def generate_self_play(
     base_replay: Path | None = None,
     workers: int | None = None,
     minimum_positions: int = 0,
+    sgf_output: Path | None = None,
     evaluator_builder: EvaluatorBuilder | None = None,
 ) -> SelfPlayOperationResult:
     """Generate one or more complete batches and atomically save their replay."""
@@ -248,6 +270,9 @@ def generate_self_play(
         raise OperationError("minimum_positions cannot exceed replay capacity")
 
     destination = output.expanduser().resolve()
+    sgf_destination = None if sgf_output is None else sgf_output.expanduser().resolve()
+    if sgf_destination == destination:
+        raise OperationError("SGF output must not resolve to the replay output")
     buffer = (
         _new_replay(config)
         if base_replay is None
@@ -269,6 +294,7 @@ def generate_self_play(
     maximum = 0
     effective_workers = 0
     inference_mode = "direct"
+    completed_games: list[SelfPlayGame] = []
 
     while generation_batches == 0 or len(buffer) < minimum_positions:
         result = ParallelSelfPlayRunner(
@@ -285,6 +311,7 @@ def generate_self_play(
         maximum = max(maximum, inference.max_batch_size)
         generation_batches += 1
         games_generated += len(result.games)
+        completed_games.extend(result.games)
         for game in result.games:
             positions_generated += len(game.samples)
             black_wins += game.winner is Color.BLACK
@@ -294,6 +321,20 @@ def generate_self_play(
 
     mean = positions / batches if batches else 0.0
     metrics = InferenceMetrics(requests, positions, batches, maximum, mean)
+    sgf_identity: SgfArtifactIdentity | None = None
+    if sgf_destination is not None:
+        records = _self_play_sgf_records(
+            tuple(completed_games),
+            config,
+            evaluator_name=evaluator_name,
+            checkpoint_step=checkpoint_step,
+        )
+        save_sgf_collection(sgf_destination, records)
+        sgf_identity = SgfArtifactIdentity(
+            sgf_destination,
+            sha256_file(sgf_destination),
+            len(records),
+        )
     buffer.save(destination)
     return SelfPlayOperationResult(
         output=destination,
@@ -312,6 +353,7 @@ def generate_self_play(
         effective_workers=effective_workers,
         inference_mode=inference_mode,
         inference_metrics=metrics,
+        sgf=sgf_identity,
     )
 
 
@@ -400,6 +442,7 @@ def evaluate_checkpoints(
     candidate: Path,
     incumbent: Path,
     promote_to: Path | None = None,
+    sgf_output: Path | None = None,
     evaluator_builder: EvaluatorBuilder | None = None,
 ) -> ArenaOperationResult:
     """Evaluate immutable checkpoint identities and optionally promote safely."""
@@ -407,12 +450,18 @@ def evaluate_checkpoints(
     candidate_path = candidate.expanduser().resolve()
     incumbent_path = incumbent.expanduser().resolve()
     destination = None if promote_to is None else promote_to.expanduser().resolve()
+    sgf_destination = None if sgf_output is None else sgf_output.expanduser().resolve()
     if candidate_path == incumbent_path:
         raise OperationError(
             "candidate and incumbent must resolve to different checkpoint paths"
         )
     if destination == candidate_path:
         raise OperationError("promotion destination must not resolve to the candidate path")
+    protected_paths = {candidate_path, incumbent_path}
+    if destination is not None:
+        protected_paths.add(destination)
+    if sgf_destination in protected_paths:
+        raise OperationError("SGF output must not overwrite a checkpoint artifact")
 
     candidate_sha256 = sha256_file(candidate_path)
     incumbent_sha256 = sha256_file(incumbent_path)
@@ -431,6 +480,20 @@ def evaluate_checkpoints(
         incumbent_evaluator,
         config,
     ).run()
+    sgf_identity: SgfArtifactIdentity | None = None
+    if sgf_destination is not None:
+        records = _arena_sgf_records(
+            arena.games,
+            config,
+            candidate_sha256=candidate_sha256,
+            incumbent_sha256=incumbent_sha256,
+        )
+        save_sgf_collection(sgf_destination, records)
+        sgf_identity = SgfArtifactIdentity(
+            sgf_destination,
+            sha256_file(sgf_destination),
+            len(records),
+        )
     promoted = False
     if arena.promotion_eligible and destination is not None:
         atomic_promote_checkpoint(
@@ -446,6 +509,56 @@ def evaluate_checkpoints(
         promotion_requested=destination is not None,
         promoted=promoted,
         promoted_to=destination if promoted else None,
+        sgf=sgf_identity,
+    )
+
+
+def _self_play_sgf_records(
+    games: tuple[SelfPlayGame, ...],
+    config: AppConfig,
+    *,
+    evaluator_name: str,
+    checkpoint_step: int | None,
+) -> tuple[SgfGameRecord, ...]:
+    rules = _rules(config)
+    player = (
+        evaluator_name
+        if checkpoint_step is None
+        else f"{evaluator_name}-step-{checkpoint_step}"
+    )
+    return tuple(
+        SgfGameRecord(
+            rules=rules,
+            actions=game.actions,
+            final_score=game.final_score,
+            game_name=f"self-play-{game.game_index:020d}",
+            black_player=player,
+            white_player=player,
+        )
+        for game in games
+    )
+
+
+def _arena_sgf_records(
+    games: tuple[ArenaGameResult, ...],
+    config: AppConfig,
+    *,
+    candidate_sha256: str,
+    incumbent_sha256: str,
+) -> tuple[SgfGameRecord, ...]:
+    rules = _rules(config)
+    candidate = f"candidate-{candidate_sha256}"
+    incumbent = f"incumbent-{incumbent_sha256}"
+    return tuple(
+        SgfGameRecord(
+            rules=rules,
+            actions=game.actions,
+            final_score=game.final_score,
+            game_name=f"arena-pair-{game.pair_index:06d}-game-{game.game_index:06d}",
+            black_player=candidate if game.candidate_color is Color.BLACK else incumbent,
+            white_player=candidate if game.candidate_color is Color.WHITE else incumbent,
+        )
+        for game in games
     )
 
 
@@ -526,6 +639,14 @@ def _new_replay(config: AppConfig) -> ReplayBuffer:
     )
 
 
+def _rules(config: AppConfig) -> Rules:
+    return Rules(
+        board_size=config.game.board_size,
+        komi=config.game.komi,
+        ruleset=Ruleset(config.game.rules.ruleset),
+    )
+
+
 def _validate_replay_metadata(
     replay: ReplayBuffer,
     config: AppConfig,
@@ -551,6 +672,7 @@ __all__ = [
     "CheckpointIdentity",
     "OperationError",
     "SelfPlayOperationResult",
+    "SgfArtifactIdentity",
     "TrainingOperationResult",
     "arena_game_record",
     "atomic_promote_checkpoint",

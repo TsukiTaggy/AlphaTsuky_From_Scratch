@@ -97,6 +97,7 @@ def _game(
         game_index=pair_index * 2 + (candidate_color is Color.WHITE),
         candidate_color=candidate_color,
         opening_actions=opening,
+        actions=(*opening, 25, 25),
         move_count=len(opening) + 2,
         final_score=_score(winner),
         winner=winner,
@@ -210,6 +211,8 @@ def test_real_pass_arena_is_repeatable_and_scores_color_swapped_games() -> None:
     assert not first.promotion_eligible
     for game in first.games:
         assert game.move_count == config.arena.opening_moves + 2
+        assert game.actions[: config.arena.opening_moves] == game.opening_actions
+        assert game.actions[-2:] == (25, 25)
         assert game.winner is Color.WHITE
 
 
@@ -284,7 +287,9 @@ def test_evaluator_failure_is_wrapped_as_typed_game_error() -> None:
         ({"game_index": 1}, "game_index must identify"),
         ({"candidate_color": Color.EMPTY}, "candidate_color"),
         ({"opening_actions": (25,)}, "non-pass"),
-        ({"move_count": 2}, "two passes"),
+        ({"move_count": 2}, "complete action count"),
+        ({"actions": (1, 25, 25)}, "prefix"),
+        ({"actions": (0, 25, 1)}, "two consecutive passes"),
         ({"winner": Color.WHITE}, "winner must match"),
         ({"candidate_outcome": "loss"}, "candidate_outcome must match"),
     ],
@@ -298,6 +303,7 @@ def test_game_result_rejects_inconsistent_public_data(
         "game_index": 0,
         "candidate_color": Color.BLACK,
         "opening_actions": (0,),
+        "actions": (0, 25, 25),
         "move_count": 3,
         "final_score": _score(Color.BLACK),
         "winner": Color.BLACK,

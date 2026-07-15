@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 app = typer.Typer(
     name="azgo",
-    help="Correctness-first Phase 1-9 tools for the AlphaZero Go project.",
+    help="Correctness-first Phase 1-10 tools for the AlphaZero Go project.",
     no_args_is_help=True,
     pretty_exceptions_enable=False,
 )
@@ -34,7 +34,7 @@ ConfigArgument = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-9 YAML configuration.",
+        help="Path to a Phase 1-10 YAML configuration.",
     ),
 ]
 ConfigOption = Annotated[
@@ -47,7 +47,7 @@ ConfigOption = Annotated[
         dir_okay=False,
         readable=True,
         resolve_path=True,
-        help="Path to a Phase 1-9 YAML configuration.",
+        help="Path to a Phase 1-10 YAML configuration.",
     ),
 ]
 MovesOption = Annotated[
@@ -182,6 +182,28 @@ PromotionOption = Annotated[
         help="Atomically copy an eligible candidate to this explicit destination.",
     ),
 ]
+SgfOutputOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--sgf-output",
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Optional deterministic SGF FF[4] collection to create.",
+    ),
+]
+SgfInputOption = Annotated[
+    Path,
+    typer.Option(
+        "--input",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="UTF-8 SGF FF[4] collection to validate and inspect.",
+    ),
+]
 
 
 class ArenaCommandError(ValueError):
@@ -204,7 +226,7 @@ def _load_or_exit(path: Path) -> AppConfig:
 
 @app.command("validate-config")
 def validate_config_command(config: ConfigArgument) -> None:
-    """Compose and strictly validate a Phase 1-9 configuration."""
+    """Compose and strictly validate a Phase 1-10 configuration."""
 
     settings = _load_or_exit(config)
     typer.echo(json.dumps(settings.model_dump(mode="json"), indent=2, sort_keys=True))
@@ -249,6 +271,7 @@ def generate_self_play(
     overwrite: OverwriteOption = False,
     checkpoint: CheckpointOption = None,
     workers: WorkersOption = None,
+    sgf_output: SgfOutputOption = None,
 ) -> None:
     """Generate deterministic games into a replay snapshot."""
 
@@ -260,6 +283,7 @@ def generate_self_play(
             overwrite=overwrite,
             checkpoint=checkpoint,
             workers=workers,
+            sgf_output=sgf_output,
         )
     except _self_play_failures() as exc:
         typer.echo(f"Self-play failed: {exc}", err=True)
@@ -298,6 +322,7 @@ def evaluate_arena(
     candidate: ArenaCandidateOption,
     incumbent: ArenaIncumbentOption,
     promote_to: PromotionOption = None,
+    sgf_output: SgfOutputOption = None,
 ) -> None:
     """Evaluate candidate and incumbent checkpoints and optionally promote."""
 
@@ -308,9 +333,23 @@ def evaluate_arena(
             candidate=candidate,
             incumbent=incumbent,
             promote_to=promote_to,
+            sgf_output=sgf_output,
         )
     except _arena_failures() as exc:
         typer.echo(f"Arena evaluation failed: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+
+
+@app.command("inspect-sgf")
+def inspect_sgf(config: ConfigOption, sgf_input: SgfInputOption) -> None:
+    """Validate complete linear SGF games and report their engine results."""
+
+    settings = _load_or_exit(config)
+    try:
+        report = _run_sgf_inspection(settings, sgf_input)
+    except _sgf_failures() as exc:
+        typer.echo(f"SGF inspection failed: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(report, indent=2, sort_keys=True))
 
@@ -429,6 +468,7 @@ def _run_arena(
     candidate: Path,
     incumbent: Path,
     promote_to: Path | None,
+    sgf_output: Path | None = None,
 ) -> dict[str, object]:
     """Evaluate two immutable checkpoint identities and optionally promote."""
 
@@ -439,8 +479,64 @@ def _run_arena(
         candidate=candidate,
         incumbent=incumbent,
         promote_to=promote_to,
+        sgf_output=sgf_output,
         evaluator_builder=_build_evaluator,
     ).report()
+
+
+def _sgf_failures() -> tuple[type[Exception], ...]:
+    """Return SGF command failures without loading the codec at CLI startup."""
+
+    from azgo.sgf import SgfError
+
+    return (SgfError, OSError, ValueError)
+
+
+def _run_sgf_inspection(settings: AppConfig, source: Path) -> dict[str, object]:
+    """Load and engine-validate a collection before producing a stable summary."""
+
+    from azgo.game import Color, Rules, Ruleset
+    from azgo.sgf import load_sgf_collection
+
+    rules = Rules(
+        board_size=settings.game.board_size,
+        komi=settings.game.komi,
+        ruleset=Ruleset(settings.game.rules.ruleset),
+    )
+    records = load_sgf_collection(
+        source,
+        expected_rules=rules,
+        zobrist_seed=settings.zobrist.seed,
+    )
+    games: list[dict[str, object]] = []
+    for index, record in enumerate(records):
+        winner = record.winner
+        result = (
+            "0"
+            if winner is None
+            else f"{'B' if winner is Color.BLACK else 'W'}+{abs(record.final_score.black_margin)}"
+        )
+        games.append(
+            {
+                "black_player": record.black_player,
+                "black_score": float(record.final_score.black_score),
+                "game_index": index,
+                "game_name": record.game_name,
+                "move_count": record.move_count,
+                "result": result,
+                "white_player": record.white_player,
+                "white_score": float(record.final_score.white_score),
+                "winner": None if winner is None else winner.name.lower(),
+            }
+        )
+    return {
+        "board_size": rules.board_size,
+        "games": games,
+        "games_count": len(games),
+        "input": str(source.expanduser().resolve()),
+        "komi": rules.komi,
+        "ruleset": rules.ruleset.value,
+    }
 
 
 def _run_search(
@@ -518,6 +614,7 @@ def _run_self_play(
     overwrite: bool,
     checkpoint: Path | None = None,
     workers: int | None = None,
+    sgf_output: Path | None = None,
 ) -> dict[str, object]:
     """Generate a complete game batch, then atomically update replay storage."""
 
@@ -545,6 +642,7 @@ def _run_self_play(
         checkpoint=checkpoint,
         base_replay=base_replay,
         workers=workers,
+        sgf_output=sgf_output,
         evaluator_builder=_build_evaluator,
     ).report()
 

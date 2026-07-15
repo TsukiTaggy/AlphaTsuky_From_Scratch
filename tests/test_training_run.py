@@ -16,6 +16,7 @@ from azgo.learner import TrainingError, TrainingMetrics
 from azgo.operations import (
     CheckpointIdentity,
     SelfPlayOperationResult,
+    SgfArtifactIdentity,
     TrainingOperationResult,
 )
 from azgo.training_run import TrainingRunError, TrainingRunRunner
@@ -63,6 +64,7 @@ class _FakeArenaOperation:
         *,
         promoted: bool,
         score: float,
+        sgf: SgfArtifactIdentity | None,
     ) -> None:
         self.candidate = candidate
         self.incumbent = incumbent
@@ -70,9 +72,10 @@ class _FakeArenaOperation:
             promotion_eligible=promoted,
             candidate_score=score,
         )
+        self.sgf = sgf
 
     def report(self) -> dict[str, object]:
-        return {
+        report: dict[str, object] = {
             "candidate": str(self.candidate.path),
             "candidate_score": self.arena.candidate_score,
             "candidate_sha256": self.candidate.sha256,
@@ -82,6 +85,10 @@ class _FakeArenaOperation:
             "incumbent_step": self.incumbent.step,
             "promotion_eligible": self.arena.promotion_eligible,
         }
+        if self.sgf is not None:
+            report["sgf_output"] = str(self.sgf.path)
+            report["sgf_sha256"] = self.sgf.sha256
+        return report
 
 
 def _install_fake_operations(
@@ -126,6 +133,7 @@ def _install_fake_operations(
         base_replay: Path | None = None,
         workers: int | None = None,
         minimum_positions: int = 0,
+        sgf_output: Path | None = None,
         **kwargs: object,
     ) -> SelfPlayOperationResult:
         del kwargs
@@ -136,6 +144,14 @@ def _install_fake_operations(
         maybe_fail("self_play")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(f"replay-{call_index}".encode())
+        sgf: SgfArtifactIdentity | None = None
+        if sgf_output is not None:
+            sgf_output.write_bytes(f"self-play-sgf-{call_index}".encode())
+            sgf = SgfArtifactIdentity(
+                sgf_output.resolve(),
+                operations.sha256_file(sgf_output),
+                config.self_play.games,
+            )
         return SelfPlayOperationResult(
             output=output.resolve(),
             board_size=config.game.board_size,
@@ -153,6 +169,7 @@ def _install_fake_operations(
             effective_workers=workers or config.self_play.workers,
             inference_mode="deterministic_batch",
             inference_metrics=InferenceMetrics(0, 0, 0, 0, 0.0),
+            sgf=sgf,
         )
 
     def fake_training(
@@ -192,9 +209,10 @@ def _install_fake_operations(
         *,
         candidate: Path,
         incumbent: Path,
+        sgf_output: Path | None = None,
         **kwargs: object,
     ) -> _FakeArenaOperation:
-        del config, kwargs
+        del kwargs
         call_index = len(calls["arena"])
         calls["arena"].append((candidate, incumbent))
         maybe_fail("arena")
@@ -215,11 +233,20 @@ def _install_fake_operations(
             incumbent_step,
         )
         promoted = promotions[min(call_index, len(promotions) - 1)]
+        sgf: SgfArtifactIdentity | None = None
+        if sgf_output is not None:
+            sgf_output.write_bytes(f"arena-sgf-{call_index}".encode())
+            sgf = SgfArtifactIdentity(
+                sgf_output.resolve(),
+                operations.sha256_file(sgf_output),
+                config.arena.games,
+            )
         return _FakeArenaOperation(
             candidate_identity,
             incumbent_identity,
             promoted=promoted,
             score=0.75 if promoted else 0.25,
+            sgf=sgf,
         )
 
     monkeypatch.setattr(operations, "bootstrap_checkpoint", fake_bootstrap)
@@ -232,6 +259,7 @@ def _install_fake_operations(
 def _disable_resume_semantic_checks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(TrainingRunRunner, "_verify_checkpoint", lambda *args: None)
     monkeypatch.setattr(TrainingRunRunner, "_verify_replay", lambda *args: None)
+    monkeypatch.setattr(TrainingRunRunner, "_verify_sgf", lambda *args: None)
 
 
 def test_two_cycle_run_tracks_acceptance_rejection_and_artifact_lineage(
@@ -426,6 +454,27 @@ def test_resume_rejects_path_escape_and_hash_corruption(
         TrainingRunRunner(_config(cycles=1), run_directory).run(resume=True)
 
 
+def test_resume_rejects_committed_sgf_hash_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_resume_semantic_checks(monkeypatch)
+    _install_fake_operations(monkeypatch, promotions=(True,))
+    run_directory = tmp_path / "run"
+    TrainingRunRunner(_config(cycles=1), run_directory).run()
+    sgf = run_directory / "cycles" / "000001" / "self-play.sgf"
+    sgf.write_bytes(b"corrupted")
+
+    def verify_hash(runner: TrainingRunRunner, record: object) -> None:
+        path = runner._artifact_path(record.path)  # type: ignore[attr-defined]
+        if operations.sha256_file(path) != record.sha256:  # type: ignore[attr-defined]
+            raise TrainingRunError("SGF hash mismatch")
+
+    monkeypatch.setattr(TrainingRunRunner, "_verify_sgf", verify_hash)
+    with pytest.raises(TrainingRunError, match="SGF hash mismatch"):
+        TrainingRunRunner(_config(cycles=1), run_directory).run(resume=True)
+
+
 def test_fresh_and_resume_modes_refuse_wrong_directory_state(tmp_path: Path) -> None:
     existing = tmp_path / "existing"
     existing.mkdir()
@@ -459,9 +508,85 @@ def test_real_small_run_completes_and_resume_is_a_validated_noop(tmp_path: Path)
     assert created.next_game_index >= config.self_play.games
     assert created.incumbent.is_file()
     assert created.replay.is_file()
+    self_play_sgf = run_directory / "cycles" / "000001" / "self-play.sgf"
+    arena_sgf = run_directory / "cycles" / "000001" / "arena.sgf"
+    assert self_play_sgf.is_file()
+    assert arena_sgf.is_file()
+    manifest = json.loads((run_directory / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["format_version"] == 2
+    assert manifest["sgf_start_cycle"] == 1
+    assert manifest["cycles"][0]["self_play_sgf"]["path"] == (
+        "cycles/000001/self-play.sgf"
+    )
+    assert manifest["cycles"][0]["arena_sgf"]["path"] == "cycles/000001/arena.sgf"
     assert resumed.cycles_completed_this_invocation == 0
     assert resumed.incumbent_sha256 == created.incumbent_sha256
     assert resumed.replay_sha256 == created.replay_sha256
+
+
+def test_phase9_manifest_migrates_without_requiring_historical_sgf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_resume_semantic_checks(monkeypatch)
+    calls = _install_fake_operations(monkeypatch, promotions=(True,))
+    run_directory = tmp_path / "legacy"
+    TrainingRunRunner(_config(cycles=1), run_directory).run()
+    manifest_path = run_directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["format_version"] = 1
+    manifest.pop("sgf_start_cycle")
+    cycle = manifest["cycles"][0]
+    cycle.pop("self_play_sgf")
+    cycle.pop("arena_sgf")
+    cycle["self_play_report"].pop("sgf_output", None)
+    cycle["self_play_report"].pop("sgf_sha256", None)
+    cycle["arena_report"].pop("sgf_output", None)
+    cycle["arena_report"].pop("sgf_sha256", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    for name in ("self-play.sgf", "arena.sgf"):
+        (run_directory / "cycles" / "000001" / name).unlink()
+    counts = {name: len(values) for name, values in calls.items()}
+
+    result = TrainingRunRunner(_config(cycles=1), run_directory).run(resume=True)
+
+    assert result.cycles_completed_this_invocation == 0
+    assert {name: len(values) for name, values in calls.items()} == counts
+    migrated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert migrated["format_version"] == 2
+    assert migrated["sgf_start_cycle"] == 2
+    assert migrated["cycles"][0]["self_play_sgf"] is None
+    assert migrated["cycles"][0]["arena_sgf"] is None
+
+
+def test_phase9_mid_cycle_migration_starts_recording_after_unrecoverable_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_resume_semantic_checks(monkeypatch)
+    _install_fake_operations(monkeypatch, promotions=(True,), fail_once="training")
+    run_directory = tmp_path / "legacy-interrupted"
+    with pytest.raises(TrainingRunError, match="interruption"):
+        TrainingRunRunner(_config(cycles=1), run_directory).run()
+
+    manifest_path = run_directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["format_version"] = 1
+    manifest.pop("sgf_start_cycle")
+    progress = manifest["in_progress"]
+    progress.pop("self_play_sgf")
+    progress["self_play_report"].pop("sgf_output", None)
+    progress["self_play_report"].pop("sgf_sha256", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (run_directory / "cycles" / "000001" / "self-play.sgf").unlink()
+
+    result = TrainingRunRunner(_config(cycles=1), run_directory).run(resume=True)
+
+    assert result.completed_cycles == 1
+    migrated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert migrated["sgf_start_cycle"] == 2
+    assert migrated["cycles"][0]["self_play_sgf"] is None
+    assert migrated["cycles"][0]["arena_sgf"] is None
 
 
 def _manifest_paths(value: object) -> list[str]:

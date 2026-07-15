@@ -246,7 +246,7 @@ class TrainingRunConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
-    """Complete validated configuration for Phases 1 through 9."""
+    """Complete validated configuration for Phases 1 through 10."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -311,6 +311,6 @@ def validate_config(config: DictConfig) -> AppConfig:
 
 
 def load_config(path: str | Path, overrides: tuple[str, ...] = ()) -> AppConfig:
-    """Compose and validate a Phase 1-9 YAML configuration."""
+    """Compose and validate a Phase 1-10 YAML configuration."""
 
     return validate_config(compose_config(path, overrides))

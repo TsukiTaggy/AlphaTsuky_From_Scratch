@@ -20,12 +20,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from azgo import operations
 from azgo.checkpoint import load_checkpoint
 from azgo.config import AppConfig
+from azgo.game import Rules, Ruleset
 from azgo.replay import ReplayBuffer
+from azgo.sgf import load_sgf_collection
 
 if TYPE_CHECKING:
     from azgo.operations import ArenaOperationResult
 
-_MANIFEST_VERSION: Literal[1] = 1
+_MANIFEST_VERSION: Literal[2] = 2
 _MANIFEST_NAME = "manifest.json"
 _HEX_LENGTH = 64
 
@@ -97,6 +99,10 @@ class _ReplayRecord(_ArtifactRecord):
     next_game_index: int = Field(strict=True, ge=0)
 
 
+class _SgfRecord(_ArtifactRecord):
+    games: int = Field(strict=True, ge=1)
+
+
 class _InProgressRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -104,6 +110,7 @@ class _InProgressRecord(BaseModel):
     stage: Literal["self_play", "training", "arena"]
     replay: _ReplayRecord | None = None
     candidate: _CheckpointRecord | None = None
+    self_play_sgf: _SgfRecord | None = None
     self_play_report: dict[str, object] | None = None
     training_report: dict[str, object] | None = None
 
@@ -122,6 +129,7 @@ class _InProgressRecord(BaseModel):
             for value in (
                 self.replay,
                 self.candidate,
+                self.self_play_sgf,
                 self.self_play_report,
                 self.training_report,
             )
@@ -160,6 +168,8 @@ class _CycleRecord(BaseModel):
     self_play_report: dict[str, object]
     training_report: dict[str, object]
     arena_report: dict[str, object]
+    self_play_sgf: _SgfRecord | None = None
+    arena_sgf: _SgfRecord | None = None
 
     @field_validator("self_play_report", "training_report", "arena_report")
     @classmethod
@@ -186,10 +196,11 @@ class _CycleRecord(BaseModel):
 class _RunManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    format_version: Literal[1]
+    format_version: Literal[2]
     settings: dict[str, object]
     config_sha256: str = Field(min_length=_HEX_LENGTH, max_length=_HEX_LENGTH)
     target_cycles: int = Field(strict=True, ge=1)
+    sgf_start_cycle: int = Field(strict=True, ge=1)
     effective_workers: int = Field(strict=True, ge=1)
     bootstrap: _CheckpointRecord
     incumbent: _CheckpointRecord
@@ -211,6 +222,8 @@ class _RunManifest(BaseModel):
     def validate_progression(self) -> Self:
         if len(self.cycles) > self.target_cycles:
             raise ValueError("completed cycles cannot exceed target_cycles")
+        if self.sgf_start_cycle > self.target_cycles + 1:
+            raise ValueError("sgf_start_cycle cannot exceed target_cycles + 1")
         current = self.bootstrap
         for expected_cycle, cycle in enumerate(self.cycles, start=1):
             if cycle.cycle != expected_cycle:
@@ -220,6 +233,15 @@ class _RunManifest(BaseModel):
             current = cycle.candidate if cycle.promoted else current
             if cycle.incumbent_after_sha256 != current.sha256:
                 raise ValueError("cycle incumbent result is inconsistent")
+            records = (cycle.self_play_sgf, cycle.arena_sgf)
+            if expected_cycle >= self.sgf_start_cycle and any(
+                record is None for record in records
+            ):
+                raise ValueError("recorded cycles require self-play and arena SGF artifacts")
+            if expected_cycle < self.sgf_start_cycle and any(
+                record is not None for record in records
+            ):
+                raise ValueError("legacy cycles cannot contain SGF artifacts")
         if self.incumbent != current:
             raise ValueError("current incumbent does not match completed cycle lineage")
         if self.cycles and self.active_replay is None:
@@ -229,6 +251,13 @@ class _RunManifest(BaseModel):
                 raise ValueError("in-progress cycle must follow completed cycles")
             if self.in_progress.cycle > self.target_cycles:
                 raise ValueError("in-progress cycle cannot exceed target_cycles")
+            requires_sgf = self.in_progress.cycle >= self.sgf_start_cycle
+            has_committed_self_play = self.in_progress.stage in {"training", "arena"}
+            if requires_sgf and has_committed_self_play:
+                if self.in_progress.self_play_sgf is None:
+                    raise ValueError("recorded self-play stages require an SGF artifact")
+            elif self.in_progress.self_play_sgf is not None:
+                raise ValueError("this in-progress cycle cannot contain an SGF artifact")
         return self
 
 
@@ -364,6 +393,7 @@ class TrainingRunRunner:
                 settings=settings,
                 config_sha256=_config_sha256(self._config),
                 target_cycles=self._config.training_run.cycles,
+                sgf_start_cycle=1,
                 effective_workers=self._worker_override,
                 bootstrap=checkpoint,
                 incumbent=checkpoint,
@@ -398,6 +428,7 @@ class TrainingRunRunner:
         if not self._workers_supplied:
             self._worker_override = manifest.effective_workers
         self._verify_manifest_artifacts(manifest)
+        _write_manifest(self._run_directory, manifest)
         return manifest
 
     def _verify_manifest_artifacts(self, manifest: _RunManifest) -> None:
@@ -424,6 +455,25 @@ class TrainingRunRunner:
                 continue
             replay_seen.add(identity)
             self._verify_replay(replay)
+
+        sgf_records = [
+            record
+            for cycle in manifest.cycles
+            for record in (cycle.self_play_sgf, cycle.arena_sgf)
+            if record is not None
+        ]
+        if (
+            manifest.in_progress is not None
+            and manifest.in_progress.self_play_sgf is not None
+        ):
+            sgf_records.append(manifest.in_progress.self_play_sgf)
+        sgf_seen: set[tuple[str, str]] = set()
+        for record in sgf_records:
+            identity = (record.path, record.sha256)
+            if identity in sgf_seen:
+                continue
+            sgf_seen.add(identity)
+            self._verify_sgf(record)
 
     def _verify_checkpoint(self, record: _CheckpointRecord) -> None:
         path = self._artifact_path(record.path)
@@ -466,6 +516,23 @@ class TrainingRunRunner:
         if actual != expected:
             raise TrainingRunError(f"replay metadata mismatch: {record.path}")
 
+    def _verify_sgf(self, record: _SgfRecord) -> None:
+        path = self._artifact_path(record.path)
+        if operations.sha256_file(path) != record.sha256:
+            raise TrainingRunError(f"SGF hash mismatch: {record.path}")
+        rules = Rules(
+            board_size=self._config.game.board_size,
+            komi=self._config.game.komi,
+            ruleset=Ruleset(self._config.game.rules.ruleset),
+        )
+        games = load_sgf_collection(
+            path,
+            expected_rules=rules,
+            zobrist_seed=self._config.zobrist.seed,
+        )
+        if len(games) != record.games:
+            raise TrainingRunError(f"SGF game count mismatch: {record.path}")
+
     def _run_next_stage(self, manifest: _RunManifest) -> _RunManifest:
         if manifest.in_progress is None:
             cycle = len(manifest.cycles) + 1
@@ -500,6 +567,12 @@ class TrainingRunRunner:
         output.parent.mkdir(parents=True, exist_ok=True)
         base = None if active is None else self._artifact_path(active.path)
         incumbent = self._artifact_path(manifest.incumbent.path)
+        sgf_relative = f"cycles/{progress.cycle:06d}/self-play.sgf"
+        sgf_output = (
+            self._artifact_path(sgf_relative)
+            if progress.cycle >= manifest.sgf_start_cycle
+            else None
+        )
         result = operations.generate_self_play(
             self._config,
             output,
@@ -507,6 +580,7 @@ class TrainingRunRunner:
             base_replay=base,
             workers=manifest.effective_workers,
             minimum_positions=self._config.learner.batch_size,
+            sgf_output=sgf_output,
         )
         replay = _ReplayRecord(
             path=relative,
@@ -517,10 +591,21 @@ class TrainingRunRunner:
         )
         report = result.report()
         report["output"] = relative
+        self_play_sgf: _SgfRecord | None = None
+        if sgf_output is not None:
+            if result.sgf is None:
+                raise TrainingRunError("self-play operation did not return its SGF artifact")
+            self_play_sgf = _SgfRecord(
+                path=sgf_relative,
+                sha256=result.sgf.sha256,
+                games=result.sgf.games,
+            )
+            report["sgf_output"] = sgf_relative
         updated_progress = _InProgressRecord(
             cycle=progress.cycle,
             stage="training",
             replay=replay,
+            self_play_sgf=self_play_sgf,
             self_play_report=report,
         )
         updated = _updated_manifest(manifest, in_progress=updated_progress)
@@ -556,6 +641,7 @@ class TrainingRunRunner:
             stage="arena",
             replay=progress.replay,
             candidate=candidate,
+            self_play_sgf=progress.self_play_sgf,
             self_play_report=progress.self_play_report,
             training_report=report,
         )
@@ -577,10 +663,17 @@ class TrainingRunRunner:
             raise TrainingRunError("arena stage is missing committed candidate state")
         candidate_path = self._artifact_path(progress.candidate.path)
         incumbent_path = self._artifact_path(manifest.incumbent.path)
+        sgf_relative = f"cycles/{progress.cycle:06d}/arena.sgf"
+        sgf_output = (
+            self._artifact_path(sgf_relative)
+            if progress.cycle >= manifest.sgf_start_cycle
+            else None
+        )
         evaluation = operations.evaluate_checkpoints(
             self._config,
             candidate=candidate_path,
             incumbent=incumbent_path,
+            sgf_output=sgf_output,
         )
         if (
             evaluation.candidate.sha256 != progress.candidate.sha256
@@ -599,6 +692,16 @@ class TrainingRunRunner:
             progress.candidate.path,
             manifest.incumbent.path,
         )
+        arena_sgf: _SgfRecord | None = None
+        if sgf_output is not None:
+            if evaluation.sgf is None:
+                raise TrainingRunError("arena operation did not return its SGF artifact")
+            arena_sgf = _SgfRecord(
+                path=sgf_relative,
+                sha256=evaluation.sgf.sha256,
+                games=evaluation.sgf.games,
+            )
+            arena_report["sgf_output"] = sgf_relative
         cycle = _CycleRecord(
             cycle=progress.cycle,
             candidate=progress.candidate,
@@ -612,6 +715,8 @@ class TrainingRunRunner:
             self_play_report=progress.self_play_report,
             training_report=progress.training_report,
             arena_report=arena_report,
+            self_play_sgf=progress.self_play_sgf,
+            arena_sgf=arena_sgf,
         )
         updated = _updated_manifest(
             manifest,
@@ -795,11 +900,51 @@ def _write_manifest(run_directory: Path, manifest: _RunManifest) -> None:
 def _read_manifest(run_directory: Path) -> _RunManifest:
     source = run_directory / _MANIFEST_NAME
     try:
-        return _RunManifest.model_validate_json(source.read_text(encoding="utf-8"))
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if type(payload) is not dict:
+            raise TrainingRunError("run manifest root must be an object")
+        mapping = cast("dict[str, object]", payload)
+        if type(mapping.get("format_version")) is int and mapping["format_version"] == 1:
+            mapping = _migrate_phase9_manifest(mapping)
+        return _RunManifest.model_validate_json(
+            json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        )
     except FileNotFoundError as exc:
         raise TrainingRunError("run manifest is missing") from exc
+    except TrainingRunError:
+        raise
     except (json.JSONDecodeError, UnicodeError, ValidationError) as exc:
         raise TrainingRunError(f"run manifest is invalid: {exc}") from exc
+
+
+def _migrate_phase9_manifest(payload: dict[str, object]) -> dict[str, object]:
+    """Normalize one strict Phase 9 manifest into the Phase 10 SGF schema."""
+
+    cycles_value = payload.get("cycles")
+    if type(cycles_value) is not list:
+        raise TrainingRunError("legacy run manifest cycles must be an array")
+    cycles = cast("list[object]", cycles_value)
+    for value in cycles:
+        if type(value) is not dict:
+            raise TrainingRunError("legacy run manifest cycle must be an object")
+        cycle = cast("dict[str, object]", value)
+        cycle["self_play_sgf"] = None
+        cycle["arena_sgf"] = None
+
+    start_cycle = len(cycles) + 1
+    progress_value = payload.get("in_progress")
+    if progress_value is not None:
+        if type(progress_value) is not dict:
+            raise TrainingRunError("legacy in-progress state must be an object")
+        progress = cast("dict[str, object]", progress_value)
+        stage = progress.get("stage")
+        if stage in {"training", "arena"}:
+            start_cycle += 1
+        progress["self_play_sgf"] = None
+
+    payload["format_version"] = _MANIFEST_VERSION
+    payload["sgf_start_cycle"] = start_cycle
+    return payload
 
 
 def _relative_arena_report(
